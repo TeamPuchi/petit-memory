@@ -424,3 +424,5 @@ m5-petit-memory/
 ## License
 
 Apache License 2.0
+
+本プロジェクトは [lifemate-ai/embodied-claude](https://github.com/lifemate-ai/embodied-claude)（MITライセンス）の memory-mcp コンポーネントを元に、M5 Petit向けに大幅に改変したものです。元のライセンスと著作権表示は [NOTICE](NOTICE) を参照してください。
