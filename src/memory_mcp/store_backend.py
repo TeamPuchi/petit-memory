@@ -220,7 +220,11 @@ class MemoryStoreBackend(Protocol):
 def create_backend(config: MemoryConfig) -> MemoryStoreBackend:
     """`config.store_backend` で保管層の実装を選ぶ。
 
-    `PETIT_MEMORY_STORE=sqlite|dynamo`（既定 sqlite）。
+    `PETIT_MEMORY_STORE=sqlite|dynamo|dual`（既定 sqlite）。
+
+    - `sqlite` — 家コンテナ内の SQLite ファイル
+    - `dynamo` — DynamoDB の単一表だけ
+    - `dual`   — 段1 の片流し複製。書きは SQLite と DynamoDB の両方、読みは SQLite
     """
     name = (config.store_backend or "sqlite").strip().lower()
     if name == "sqlite":
@@ -231,4 +235,15 @@ def create_backend(config: MemoryConfig) -> MemoryStoreBackend:
         from .dynamo_backend import DynamoMemoryStore
 
         return DynamoMemoryStore(config)
-    raise ValueError(f"Unknown PETIT_MEMORY_STORE: {config.store_backend!r} (expected 'sqlite' or 'dynamo')")
+    if name == "dual":
+        from .dual_backend import DualWriteMemoryStore
+        from .dynamo_backend import DynamoMemoryStore
+        from .sqlite_backend import SqliteMemoryStore
+
+        return DualWriteMemoryStore(
+            primary=SqliteMemoryStore(config),
+            secondary=DynamoMemoryStore(config),
+        )
+    raise ValueError(
+        f"Unknown PETIT_MEMORY_STORE: {config.store_backend!r} (expected 'sqlite', 'dynamo' or 'dual')"
+    )

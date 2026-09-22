@@ -12,6 +12,7 @@ import inspect
 import pytest
 
 from memory_mcp.config import MemoryConfig
+from memory_mcp.dual_backend import DualWriteMemoryStore
 from memory_mcp.dynamo_backend import DynamoMemoryStore
 from memory_mcp.sqlite_backend import SqliteMemoryStore
 from memory_mcp.store import MemoryStore
@@ -39,20 +40,32 @@ def test_create_backend_selects_dynamo(temp_db_path: str) -> None:
     assert isinstance(create_backend(config), DynamoMemoryStore)
 
 
+def test_create_backend_selects_dual(temp_db_path: str) -> None:
+    config = MemoryConfig(db_path=temp_db_path, collection_name="t", store_backend="dual")
+    backend = create_backend(config)
+    assert isinstance(backend, DualWriteMemoryStore)
+    assert isinstance(backend.primary, SqliteMemoryStore)
+    assert isinstance(backend.secondary, DynamoMemoryStore)
+
+
 def test_create_backend_rejects_unknown_name(temp_db_path: str) -> None:
     config = MemoryConfig(db_path=temp_db_path, collection_name="t", store_backend="postgres")
     with pytest.raises(ValueError, match="PETIT_MEMORY_STORE"):
         create_backend(config)
 
 
-def test_both_backends_satisfy_the_protocol(temp_db_path: str) -> None:
+def test_all_backends_satisfy_the_protocol(temp_db_path: str) -> None:
     config = MemoryConfig(db_path=temp_db_path, collection_name="t")
     assert isinstance(SqliteMemoryStore(config), MemoryStoreBackend)
     assert isinstance(DynamoMemoryStore(config), MemoryStoreBackend)
+    assert isinstance(
+        DualWriteMemoryStore(SqliteMemoryStore(config), DynamoMemoryStore(config)),
+        MemoryStoreBackend,
+    )
 
 
-def test_dynamo_mirrors_every_sqlite_storage_method() -> None:
-    """抽象のメソッドが両実装に揃っていること（署名も含めて）。"""
+def test_every_backend_mirrors_the_protocol_signatures() -> None:
+    """抽象のメソッドが 3 つの実装に揃っていること（署名も含めて）。"""
     protocol_methods = [
         name
         for name, member in inspect.getmembers(MemoryStoreBackend, inspect.isfunction)
@@ -62,23 +75,22 @@ def test_dynamo_mirrors_every_sqlite_storage_method() -> None:
 
     for name in protocol_methods:
         sqlite_sig = inspect.signature(getattr(SqliteMemoryStore, name))
-        dynamo_sig = inspect.signature(getattr(DynamoMemoryStore, name))
-        assert sqlite_sig == dynamo_sig, f"{name} の署名が実装間でずれている"
+        for implementation in (DynamoMemoryStore, DualWriteMemoryStore):
+            other_sig = inspect.signature(getattr(implementation, name))
+            assert sqlite_sig == other_sig, (
+                f"{name} の署名が {implementation.__name__} でずれている"
+            )
 
 
-async def test_dynamo_backend_is_a_skeleton(temp_db_path: str) -> None:
-    """段0 の DynamoDB 実装は、どの保管操作も NotImplementedError。"""
+async def test_dynamo_backend_refuses_work_before_connect(temp_db_path: str) -> None:
+    """接続前に使うと RuntimeError（段1 で実装が入ったので NotImplementedError ではない）。"""
     backend = DynamoMemoryStore(
         MemoryConfig(db_path=temp_db_path, collection_name="t", house_id="h1", petit_id="p1")
     )
-    with pytest.raises(NotImplementedError):
-        await backend.connect()
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match="not connected"):
         await backend.fetch_memory("some-id")
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match="not connected"):
         await backend.fetch_all_memories()
-    with pytest.raises(NotImplementedError):
-        await backend.delete_memory("some-id")
 
 
 def test_dynamo_key_prefixes(temp_db_path: str) -> None:
@@ -88,16 +100,18 @@ def test_dynamo_key_prefixes(temp_db_path: str) -> None:
     assert backend.partition_key == "H#h1#P#p1"
     assert backend.memory_sk("2026-09-22T10:00:00", "m1") == "MEM#2026-09-22T10:00:00#m1"
     assert backend.vector_sk("m1") == "VEC#m1"
-    assert backend.episode_sk("e1") == "EPI#e1"
+    assert backend.episode_sk("2026-09-20T09:00:00", "e1") == "EPI#2026-09-20T09:00:00#e1"
     assert backend.coactivation_sk("m1", "m2") == "COACT#m1#m2"
+    assert backend.pointer_sk("m1") == "IDX#m1"
+    assert backend.episode_pointer_sk("e1") == "IDX#EPI#e1"
 
 
-async def test_ensure_connected_is_sqlite_only(temp_db_path: str) -> None:
-    """生の接続を取る逃げ道は SQLite 実装のときだけ使える。"""
+async def test_memory_store_exposes_only_its_backend(temp_db_path: str) -> None:
+    """計算層には「生の接続」を取る口が無い（段1 でテスト用ヘルパに移した）。"""
     config = MemoryConfig(db_path=temp_db_path, collection_name="t", store_backend="dynamo")
     store = MemoryStore(config)
-    with pytest.raises(RuntimeError, match="SQLite-only"):
-        store._ensure_connected()
+    assert not hasattr(store, "_ensure_connected")
+    assert isinstance(store.backend, DynamoMemoryStore)
 
 
 # ──────────────────────────────────────────────
@@ -317,13 +331,13 @@ async def test_recall_through_the_seam(memory_store: MemoryStore) -> None:
     assert results[0].memory.content == "和太鼓の練習に行った"
 
 
-async def test_time_decay_still_lowers_old_memories(memory_store: MemoryStore) -> None:
+async def test_time_decay_still_lowers_old_memories(
+    memory_store: MemoryStore, set_memory_timestamp
+) -> None:
     """減衰の計算は計算層に残っている（保管層は素の行を返すだけ）。"""
     await memory_store.save(content="金魚の水換えをした", emotion="neutral", importance=3)
 
-    db = memory_store._ensure_connected()
-    db.execute("UPDATE memories SET timestamp = ?", ("2025-09-01T00:00:00",))
-    db.commit()
+    await set_memory_timestamp(memory_store, "2025-09-01T00:00:00")
 
     fresh = await memory_store.search_with_scoring(
         query="金魚", n_results=1, use_time_decay=False, use_emotion_boost=False
