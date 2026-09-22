@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from .config import MemoryConfig
-from .types import Episode, Memory
+from .types import Episode, ForgetMarker, Memory
 
 # `update_memory_fields` で書き換えてよい属性。保管先が変わっても同じ名前を使う。
 UPDATABLE_FIELDS: frozenset[str] = frozenset(
@@ -162,12 +162,35 @@ class MemoryStoreBackend(Protocol):
         """アクセス回数を 1 増やし、最終アクセス時刻を更新する。"""
         ...
 
-    async def delete_memory(self, memory_id: str) -> bool:
-        """記憶を消し、他の記憶からの逆参照も掃除する。無ければ False。"""
+    async def delete_memory(self, memory_id: str, forget_marker: ForgetMarker | None = None) -> bool:
+        """記憶を消し、他の記憶からの逆参照も掃除する。無ければ False。
+
+        `forget_marker` を渡すと、消えたのと同じ書き込みで「消した跡」を残す。
+        跡には本文を入れない（`ForgetMarker` を参照）。復元のための経路は作らない。
+        """
         ...
 
     async def add_bidirectional_link(self, source_id: str, target_id: str) -> None:
         """双方の `linked_ids` に相手を足す（既にあれば何もしない）。"""
+        ...
+
+    # ── 消した跡 ────────────────────────────────
+
+    async def fetch_forget_markers(self, since: str | None, limit: int) -> list[ForgetMarker]:
+        """消した跡を新しい順に取る。`since` 以降に絞る（None なら全部）。"""
+        ...
+
+    # ── 一覧の材料（段2）──────────────────────
+
+    async def fetch_indexed_memory_ids(self) -> list[str]:
+        """索引に載っている（`indexed=True`）記憶の ID だけを取る。
+
+        無作為の 1 件を選ぶのは計算なので、選ぶ側（`MemoryStore`）に ID の母集団だけ渡す。
+        """
+        ...
+
+    async def fetch_neighbors(self, memory_id: str) -> tuple[Memory | None, Memory | None]:
+        """時系列で 1 つ前・1 つ後の記憶を取る。端なら None。"""
         ...
 
     # ── ベクトル ────────────────────────────────

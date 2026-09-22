@@ -14,7 +14,7 @@ from .config import MemoryConfig, ServerConfig
 from .episode import EpisodeManager
 from .memory import MemoryStore
 from .sensory import SensoryIntegration
-from .types import CameraPosition
+from .types import CameraPosition, RecentMemoryEntry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,6 +78,16 @@ class MemoryMCPServer:
                                 "default": 0.8,
                                 "minimum": 0,
                                 "maximum": 2,
+                            },
+                            "index": {
+                                "type": "boolean",
+                                "description": "Include this memory in semantic search, recall and random pick. Set false to keep it but leave it out of those; it can still be read by ID.",
+                                "default": True,
+                            },
+                            "private": {
+                                "type": "boolean",
+                                "description": "Keep this memory on your own side. You can still search and recall it yourself; it is not meant to be shown through the household view.",
+                                "default": False,
                             },
                         },
                         "required": ["content"],
@@ -161,8 +171,38 @@ class MemoryMCPServer:
                                 "description": "Filter by category (optional)",
                                 "enum": ["daily", "philosophical", "technical", "memory", "observation", "feeling", "conversation"],
                             },
+                            "random": {
+                                "type": "integer",
+                                "description": "Mix in this many unrelated memories, picked at random from everything remembered",
+                                "default": 0,
+                                "minimum": 0,
+                                "maximum": 5,
+                            },
+                            "neighbors": {
+                                "type": "boolean",
+                                "description": "Also show the memory just before and just after each one, in time order",
+                                "default": False,
+                            },
                         },
                         "required": [],
+                    },
+                ),
+                Tool(
+                    name="forget",
+                    description="Forget a memory on purpose. The memory itself is gone for good and there is no way to bring it back; only a trace stays in the list, saying that something was forgotten and why.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "memory_id": {
+                                "type": "string",
+                                "description": "ID of the memory to forget",
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Why you are forgetting it (optional). This is kept with the trace.",
+                            },
+                        },
+                        "required": ["memory_id"],
                     },
                 ),
                 Tool(
@@ -646,6 +686,9 @@ class MemoryMCPServer:
 
                         auto_link = arguments.get("auto_link", True)
 
+                        indexed = arguments.get("index", True)
+                        private = arguments.get("private", False)
+
                         if auto_link:
                             memory = await self._memory_store.save_with_auto_link(
                                 content=content,
@@ -653,6 +696,8 @@ class MemoryMCPServer:
                                 importance=arguments.get("importance", 3),
                                 category=arguments.get("category", "daily"),
                                 link_threshold=arguments.get("link_threshold", 0.8),
+                                indexed=indexed,
+                                private=private,
                             )
                             linked_info = f"\nLinked to: {len(memory.linked_ids)} memories"
                         else:
@@ -661,8 +706,16 @@ class MemoryMCPServer:
                                 emotion=arguments.get("emotion", "neutral"),
                                 importance=arguments.get("importance", 3),
                                 category=arguments.get("category", "daily"),
+                                indexed=indexed,
+                                private=private,
                             )
                             linked_info = ""
+
+                        # 既定のまま呼ばれたときは段1 までと 1 文字も変わらない出力にする
+                        if not memory.indexed:
+                            linked_info += "\nNot indexed: left out of search, recall and random"
+                        if memory.private:
+                            linked_info += "\nPrivate: kept on your own side"
 
                         return [
                             TextContent(
@@ -738,24 +791,73 @@ class MemoryMCPServer:
                         return [TextContent(type="text", text="\n".join(output_lines))]
 
                     case "list_recent_memories":
-                        memories = await self._memory_store.list_recent(
+                        listing = await self._memory_store.list_recent_listing(
                             limit=arguments.get("limit", 10),
                             category_filter=arguments.get("category_filter"),
+                            random_count=arguments.get("random", 0),
+                            neighbors=arguments.get("neighbors", False),
                         )
 
-                        if not memories:
+                        recent_entries = [e for e in listing.entries if e.kind == "recent"]
+                        random_entries = [e for e in listing.entries if e.kind == "random"]
+
+                        if not listing.entries and not listing.forgotten:
                             return [TextContent(type="text", text="No memories found.")]
 
-                        output_lines = [f"Recent {len(memories)} memories:\n"]
-                        for i, m in enumerate(memories, 1):
-                            output_lines.append(
-                                f"--- Memory {i} ---\n"
+                        def _entry_block(index: int, entry: RecentMemoryEntry) -> str:
+                            m = entry.memory
+                            block = (
+                                f"--- Memory {index} ---\n"
                                 f"ID: {m.id}\n"
                                 f"[{m.timestamp}] [{m.emotion}] [{m.category}]\n"
                                 f"{m.content}\n"
                             )
+                            if entry.previous is not None:
+                                block += f"  before: [{entry.previous.timestamp}] {entry.previous.content}\n"
+                            if entry.next is not None:
+                                block += f"  after: [{entry.next.timestamp}] {entry.next.content}\n"
+                            return block
+
+                        output_lines = [f"Recent {len(recent_entries)} memories:\n"]
+                        for i, entry in enumerate(recent_entries, 1):
+                            output_lines.append(_entry_block(i, entry))
+
+                        if random_entries:
+                            output_lines.append(f"And {len(random_entries)} at random:\n")
+                            for i, entry in enumerate(random_entries, 1):
+                                output_lines.append(_entry_block(i, entry))
+
+                        if listing.forgotten:
+                            output_lines.append(f"Forgotten in the same stretch ({len(listing.forgotten)}):\n")
+                            for marker in listing.forgotten:
+                                why = f" — {marker.reason}" if marker.reason else ""
+                                output_lines.append(
+                                    f"[{marker.forgotten_at}] {marker.memory_id} is gone{why}\n"
+                                )
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
+
+                    case "forget":
+                        memory_id = arguments.get("memory_id", "")
+                        if not memory_id:
+                            return [TextContent(type="text", text="Error: memory_id is required")]
+
+                        reason = arguments.get("reason") or None
+                        removed = await self._memory_store.delete_memory(memory_id, reason=reason)
+
+                        if not removed:
+                            return [TextContent(type="text", text=f"No memory with ID {memory_id}.")]
+
+                        reason_line = f"\nReason: {reason}" if reason else ""
+                        return [
+                            TextContent(
+                                type="text",
+                                text=(
+                                    f"Forgotten: {memory_id}{reason_line}\n"
+                                    "A trace stays in the recent list. The memory itself cannot be brought back."
+                                ),
+                            )
+                        ]
 
                     case "get_memory_stats":
                         stats = await self._memory_store.get_stats()

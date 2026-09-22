@@ -17,10 +17,13 @@ class MemoryConfig:
     collection_name: str
     embedding_model: str = "intfloat/multilingual-e5-base"
     enable_bm25: bool = True
-    # 段0: 保管層の選択（sqlite | dynamo）。既定は sqlite。
+    # 段0: 保管層の選択（sqlite | dynamo | dual）。既定は sqlite。
     store_backend: str = "sqlite"
-    # DynamoDB 単一表の設定（store_backend="dynamo" のときだけ使う）
+    # DynamoDB 単一表の設定（store_backend が dynamo か dual のときだけ使う）
     dynamo_table: str = "house"
+    # 段2: house_id が空なら pk は `P#<pid>`（アカウントが最上位）、
+    # 値があれば従来形の `H#<hid>#P#<pid>`。組み立ては
+    # DynamoMemoryStore.partition_key 1 か所だけ。
     house_id: str = ""
     petit_id: str = ""
 

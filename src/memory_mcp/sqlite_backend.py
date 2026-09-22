@@ -14,10 +14,13 @@ from typing import Any
 from .config import MemoryConfig
 from .records import (
     EPISODE_ATTRIBUTES,
+    FORGET_ATTRIBUTES,
     MEMORY_ATTRIBUTES,
     decode_episode,
+    decode_forget_marker,
     decode_memory,
     encode_episode,
+    encode_forget_marker,
     encode_memory,
     parse_linked_ids,
     parse_links,
@@ -28,7 +31,7 @@ from .store_backend import (
     MemoryWithVector,
     VectorRow,
 )
-from .types import Episode, Memory
+from .types import Episode, ForgetMarker, Memory
 
 # ──────────────────────────────────────────────
 # DDL
@@ -55,7 +58,9 @@ CREATE TABLE IF NOT EXISTS memories (
     prediction_error REAL NOT NULL DEFAULT 0.0,
     activation_count INTEGER NOT NULL DEFAULT 0,
     last_activated TEXT NOT NULL DEFAULT '',
-    reading TEXT
+    reading TEXT,
+    indexed INTEGER NOT NULL DEFAULT 1,
+    private INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_memories_emotion    ON memories(emotion);
 CREATE INDEX IF NOT EXISTS idx_memories_category   ON memories(category);
@@ -76,6 +81,15 @@ CREATE TABLE IF NOT EXISTS coactivation (
 CREATE INDEX IF NOT EXISTS idx_coactivation_source ON coactivation(source_id);
 CREATE INDEX IF NOT EXISTS idx_coactivation_target ON coactivation(target_id);
 
+-- 段2: 消した跡。本文は持たない（跡から中身が読めてはいけない）。
+-- memories への外部キーは張らない。参照先はもう無いのが前提。
+CREATE TABLE IF NOT EXISTS forget_markers (
+    memory_id TEXT PRIMARY KEY,
+    forgotten_at TEXT NOT NULL,
+    reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_forget_markers_at ON forget_markers(forgotten_at);
+
 CREATE TABLE IF NOT EXISTS episodes (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -89,6 +103,21 @@ CREATE TABLE IF NOT EXISTS episodes (
     importance INTEGER NOT NULL DEFAULT 3
 );
 """
+
+# 段2 より前に作られた memory.db には無い列。connect() のたびに足りない分だけ埋める。
+_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("indexed", "INTEGER NOT NULL DEFAULT 1"),
+    ("private", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """ぷちてゃたちの既存 memory.db をそのまま読めるようにする。"""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(memories)")}
+    for name, ddl in _ADDED_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
+
 
 # ──────────────────────────────────────────────
 # Row → Memory / Episode
@@ -138,6 +167,7 @@ class SqliteMemoryStore:
                         stmt = stmt.strip()
                         if stmt:
                             conn.execute(stmt)
+                    _add_missing_columns(conn)
                     conn.commit()
                     return conn
 
@@ -256,7 +286,10 @@ class SqliteMemoryStore:
             conditions.append("m.timestamp <= ?")
             params.append(date_to)
 
-        where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        # 段2: index:false の記憶は意味検索・recall の母集団に入れない
+        conditions.append("m.indexed = 1")
+
+        where_clause = "WHERE " + " AND ".join(conditions)
         sql = f"SELECT m.*, e.vector FROM memories m JOIN embeddings e ON m.id = e.memory_id {where_clause}"
 
         def _fetch() -> list[MemoryWithVector]:
@@ -398,11 +431,13 @@ class SqliteMemoryStore:
 
         await asyncio.to_thread(_update)
 
-    async def delete_memory(self, memory_id: str) -> bool:
+    async def delete_memory(self, memory_id: str, forget_marker: ForgetMarker | None = None) -> bool:
         """Delete a memory and clean up references.
 
         Embeddings and coactivation rows are CASCADE-deleted by SQLite.
         linked_ids and links JSON in other memories are cleaned up manually.
+
+        段2: `forget_marker` を渡すと同じコミットで `forget_markers` に跡を残す。
         """
         db = self._ensure_connected()
 
@@ -441,6 +476,16 @@ class SqliteMemoryStore:
 
             # Delete the memory (CASCADE handles embeddings & coactivation)
             db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+
+            if forget_marker is not None:
+                attrs = encode_forget_marker(forget_marker)
+                columns = ", ".join(FORGET_ATTRIBUTES)
+                placeholders = ",".join("?" * len(FORGET_ATTRIBUTES))
+                db.execute(
+                    f"INSERT OR REPLACE INTO forget_markers ({columns}) VALUES ({placeholders})",
+                    [attrs[name] for name in FORGET_ATTRIBUTES],
+                )
+
             db.commit()
             return True
 
@@ -461,6 +506,71 @@ class SqliteMemoryStore:
             db.commit()
 
         await asyncio.to_thread(_link)
+
+    # ── 消した跡 ────────────────────────────────
+
+    async def fetch_forget_markers(self, since: str | None, limit: int) -> list[ForgetMarker]:
+        db = self._ensure_connected()
+
+        def _fetch() -> list[ForgetMarker]:
+            if since is not None:
+                rows = db.execute(
+                    "SELECT * FROM forget_markers WHERE forgotten_at >= ?"
+                    " ORDER BY forgotten_at DESC LIMIT ?",
+                    (since, max(0, limit)),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT * FROM forget_markers ORDER BY forgotten_at DESC LIMIT ?",
+                    (max(0, limit),),
+                ).fetchall()
+            return [decode_forget_marker(dict(row)) for row in rows]
+
+        return await asyncio.to_thread(_fetch)
+
+    # ── 一覧の材料（段2）──────────────────────
+
+    async def fetch_indexed_memory_ids(self) -> list[str]:
+        db = self._ensure_connected()
+
+        def _fetch() -> list[str]:
+            rows = db.execute("SELECT id FROM memories WHERE indexed = 1").fetchall()
+            return [row["id"] for row in rows]
+
+        return await asyncio.to_thread(_fetch)
+
+    async def fetch_neighbors(self, memory_id: str) -> tuple[Memory | None, Memory | None]:
+        """timestamp 順で 1 つ前・1 つ後。同時刻は id で並びを決める（DynamoDB の sk と同じ規則）。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> tuple[Memory | None, Memory | None]:
+            anchor = db.execute(
+                "SELECT timestamp, id FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
+            if anchor is None:
+                return (None, None)
+            ts, mid = anchor["timestamp"], anchor["id"]
+            previous = db.execute(
+                "SELECT * FROM memories WHERE (timestamp, id) < (?, ?)"
+                " ORDER BY timestamp DESC, id DESC LIMIT 1",
+                (ts, mid),
+            ).fetchone()
+            following = db.execute(
+                "SELECT * FROM memories WHERE (timestamp, id) > (?, ?)"
+                " ORDER BY timestamp ASC, id ASC LIMIT 1",
+                (ts, mid),
+            ).fetchone()
+            rows = [row for row in (previous, following) if row is not None]
+            decoded = {
+                row["id"]: memory
+                for row, memory in zip(rows, self._rows_to_memories(db, rows))
+            }
+            return (
+                decoded.get(previous["id"]) if previous is not None else None,
+                decoded.get(following["id"]) if following is not None else None,
+            )
+
+        return await asyncio.to_thread(_fetch)
 
     # ── ベクトル ────────────────────────────────
 
@@ -483,9 +593,11 @@ class SqliteMemoryStore:
         db = self._ensure_connected()
 
         def _fetch() -> list[VectorRow]:
+            # 段2: index:false は Hopfield の母集団にも載せない
             sql = (
                 "SELECT e.memory_id, e.vector, m.normalized_content"
                 " FROM embeddings e JOIN memories m ON m.id = e.memory_id"
+                " WHERE m.indexed = 1"
             )
             rows = db.execute(sql).fetchall()
             return [

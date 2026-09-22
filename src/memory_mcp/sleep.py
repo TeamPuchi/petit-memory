@@ -141,7 +141,8 @@ class SleepEngine:
                     "content": m.content[:80],
                 })
                 if not dry_run:
-                    await self._store.delete_memory(m.id)
+                    # 段2: 眠っている間の忘却も「消した跡」として本人から見える
+                    await self._store.delete_memory(m.id, reason="sleep: 忘却フェーズ")
 
         # 保護対象をカウント（全候補中）
         for m in candidates:

@@ -220,6 +220,9 @@ class Memory:
     activation_count: int = 0
     last_activated: str = ""
     coactivation_weights: tuple[tuple[str, float], ...] = field(default_factory=tuple)
+    # 段2: 本人が決める 2 つの面
+    indexed: bool = True  # False なら意味検索・recall・random の対象から外す（ID 指定では取れる）
+    private: bool = False  # True なら本人だけの面（DynamoDB では PRIV# 側に置く）
 
     def to_metadata(self) -> dict[str, Any]:
         """Convert to dictionary for ChromaDB metadata."""
@@ -252,6 +255,42 @@ class Memory:
             "coactivation": json.dumps(dict(self.coactivation_weights)),
         }
         return metadata
+
+
+@dataclass(frozen=True)
+class ForgetMarker:
+    """消した跡（段2）。
+
+    何を消したかは残さない。残すのは「いつ・どの ID を・なぜ消したか」だけで、
+    本文・感情・カテゴリは書かない。復元のための道具を作らないことが要件なので、
+    跡から中身が読めてはいけない。
+    """
+
+    memory_id: str
+    forgotten_at: str  # ISO 8601
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RecentMemoryEntry:
+    """`list_recent_memories` の 1 行。
+
+    `kind` は "recent"（新着そのもの）か "random"（無作為に混ぜた 1 件）。
+    `previous` / `next` は時系列で前後に並ぶ記憶（`neighbors=True` のときだけ入る）。
+    """
+
+    memory: Memory
+    kind: str = "recent"
+    previous: Memory | None = None
+    next: Memory | None = None
+
+
+@dataclass(frozen=True)
+class RecentListing:
+    """`list_recent_memories` の戻り。記憶の並びと、同じ窓に入る消した跡。"""
+
+    entries: tuple[RecentMemoryEntry, ...] = ()
+    forgotten: tuple[ForgetMarker, ...] = ()
 
 
 @dataclass(frozen=True)
