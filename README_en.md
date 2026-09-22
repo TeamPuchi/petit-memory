@@ -49,6 +49,10 @@ uv run memory-mcp
 | `MEMORY_COLLECTION_NAME` | `claude_memories` | Collection name, stored as metadata |
 | `MEMORY_EMBEDDING_MODEL` | `intfloat/multilingual-e5-base` | sentence-transformers model used for embeddings |
 | `MEMORY_ENABLE_BM25` | `true` | Enable BM25 hybrid re-ranking (`false` to disable) |
+| `PETIT_MEMORY_STORE` | `sqlite` | Storage backend (`sqlite` / `dynamo`). `dynamo` is a skeleton, not implemented yet |
+| `PETIT_MEMORY_DYNAMO_TABLE` | `house` | DynamoDB single-table name (used only with `dynamo`) |
+| `PETIT_MEMORY_HOUSE_ID` | (empty) | House id in `pk = H#<hid>#P#<pid>` (used only with `dynamo`) |
+| `PETIT_MEMORY_PETIT_ID` | (empty) | Petit id in `pk = H#<hid>#P#<pid>` (used only with `dynamo`) |
 
 ## Claude Code integration
 
