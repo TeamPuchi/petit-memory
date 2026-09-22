@@ -153,7 +153,13 @@ MemoryStore（store.py・名前も公開メソッドも据え置き）
    タイトルと要約の部分一致。SQL 固有だが件数が少ない前提の実装なので、
    「検索語と件数を渡して Episode を返す」形のまま保管側に置いた。Dynamo では Query + FilterExpression になる。
 
-5. **`save` と `save_with_auto_link` の INSERT を 1 つの `insert_memory` に統合した。**
+5. **`bump_coactivation` の 2 方向の書き込みが 1 トランザクションでなくなった。**
+   従来は片方向ずつ SELECT→UPSERT した後に 1 回だけ commit していた。
+   保管層のメソッドを「1 方向ぶんの読み・書き」に割った結果、commit が 2 回になる。
+   呼び出しは単一プロセス内の逐次実行で、途中で落ちたときに片側だけ増える可能性が増えるだけなので段0 では許容する。
+   Dynamo 側でも片方向 1 アイテムなので、原子性が要るなら TransactWriteItems を使う専用メソッドを段2 で足す。
+
+6. **`save` と `save_with_auto_link` の INSERT を 1 つの `insert_memory` に統合した。**
    従来 `save_with_auto_link` は `sensory_data` と `links` に空文字 `""` を、
    `save` は `to_metadata()` の `"[]"` を書いていた。統合後は両方 `"[]"` になる。
    読み出し側（`_parse_sensory_data` / `_parse_links`）はどちらも空タプルに解くため、
