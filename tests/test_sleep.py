@@ -111,7 +111,7 @@ class TestIsFirstExperience:
 
 
 @pytest_asyncio.fixture
-async def store_with_old_memories(memory_store: MemoryStore):
+async def store_with_old_memories(memory_store: MemoryStore, set_memory_timestamp):
     """古い記憶を持つストアを作成."""
     now = datetime.now()
     old = now - timedelta(days=30)
@@ -124,12 +124,7 @@ async def store_with_old_memories(memory_store: MemoryStore):
         category="daily",
     )
     # 手動でタイムスタンプを古くする
-    db = memory_store._ensure_connected()
-    db.execute(
-        "UPDATE memories SET timestamp = ? WHERE content = ?",
-        (old.isoformat(), "何もない日だった"),
-    )
-    db.commit()
+    await set_memory_timestamp(memory_store, old.isoformat(), content="何もない日だった")
 
     # 低重要度だが emotion あり（保護対象）
     await memory_store.save(
@@ -138,11 +133,7 @@ async def store_with_old_memories(memory_store: MemoryStore):
         importance=1,
         category="daily",
     )
-    db.execute(
-        "UPDATE memories SET timestamp = ? WHERE content = ?",
-        (old.isoformat(), "嬉しい出来事"),
-    )
-    db.commit()
+    await set_memory_timestamp(memory_store, old.isoformat(), content="嬉しい出来事")
 
     # 高重要度（保護対象）
     await memory_store.save(
@@ -151,11 +142,7 @@ async def store_with_old_memories(memory_store: MemoryStore):
         importance=5,
         category="memory",
     )
-    db.execute(
-        "UPDATE memories SET timestamp = ? WHERE content = ?",
-        (old.isoformat(), "大切な思い出"),
-    )
-    db.commit()
+    await set_memory_timestamp(memory_store, old.isoformat(), content="大切な思い出")
 
     # 中重要度・neutral（減衰対象候補）
     await memory_store.save(
@@ -164,11 +151,7 @@ async def store_with_old_memories(memory_store: MemoryStore):
         importance=2,
         category="conversation",
     )
-    db.execute(
-        "UPDATE memories SET timestamp = ? WHERE content = ?",
-        (old.isoformat(), "普通の会話をした"),
-    )
-    db.commit()
+    await set_memory_timestamp(memory_store, old.isoformat(), content="普通の会話をした")
 
     # 初めての体験（保護対象）
     await memory_store.save(
@@ -177,11 +160,7 @@ async def store_with_old_memories(memory_store: MemoryStore):
         importance=1,
         category="observation",
     )
-    db.execute(
-        "UPDATE memories SET timestamp = ? WHERE content = ?",
-        (old.isoformat(), "初めて星を見た"),
-    )
-    db.commit()
+    await set_memory_timestamp(memory_store, old.isoformat(), content="初めて星を見た")
 
     return memory_store
 
@@ -272,7 +251,7 @@ async def test_sleep_protected_count(store_with_old_memories: MemoryStore):
 
 
 @pytest.mark.asyncio
-async def test_sleep_episode_protection(memory_store: MemoryStore):
+async def test_sleep_episode_protection(memory_store: MemoryStore, set_memory_timestamp):
     """エピソード所属の記憶は削除されない."""
     now = datetime.now()
     old = now - timedelta(days=30)
@@ -285,12 +264,7 @@ async def test_sleep_episode_protection(memory_store: MemoryStore):
         category="daily",
         episode_id="ep-test",
     )
-    db = memory_store._ensure_connected()
-    db.execute(
-        "UPDATE memories SET timestamp = ? WHERE id = ?",
-        (old.isoformat(), mem.id),
-    )
-    db.commit()
+    await set_memory_timestamp(memory_store, old.isoformat(), memory_id=mem.id)
 
     engine = SleepEngine(memory_store)
     await engine.run(dry_run=False)

@@ -152,21 +152,6 @@ class MemoryStore:
         """保管層。段1 以降で差し替える対象。"""
         return self._backend
 
-    def _ensure_connected(self) -> Any:
-        """生の SQLite 接続を返す互換用の逃げ道（テストのみが使う）。
-
-        SQLite 以外の保管層では使えない。段1 以降でテスト側に
-        書き込みヘルパを用意して消す。
-        """
-        from .sqlite_backend import SqliteMemoryStore
-
-        if not isinstance(self._backend, SqliteMemoryStore):
-            raise RuntimeError(
-                "_ensure_connected() is SQLite-only; "
-                f"current backend is {type(self._backend).__name__}"
-            )
-        return self._backend.connection
-
     # ── Embedding helpers ───────────────────────
 
     async def _encode_document(self, text: str) -> list[float]:
