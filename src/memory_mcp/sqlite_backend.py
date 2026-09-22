@@ -239,6 +239,25 @@ class SqliteMemoryStore:
         ).fetchall()
         return tuple((row["target_id"], float(row["weight"])) for row in rows)
 
+    def _get_coactivation_map(
+        self, db: sqlite3.Connection, memory_ids: list[str]
+    ) -> dict[str, tuple[tuple[str, float], ...]]:
+        """複数 ID ぶんの共活性をまとめて引く（1 件ずつの往復を避けるため）。"""
+        grouped: dict[str, list[tuple[str, float]]] = {}
+        chunk_size = 500  # SQLite のバインド変数上限（既定 999）に収める
+        for start in range(0, len(memory_ids), chunk_size):
+            chunk = memory_ids[start : start + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            rows = db.execute(
+                f"SELECT source_id, target_id, weight FROM coactivation WHERE source_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                grouped.setdefault(row["source_id"], []).append(
+                    (row["target_id"], float(row["weight"]))
+                )
+        return {mid: tuple(pairs) for mid, pairs in grouped.items()}
+
     def _rows_to_memories(self, db: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[Memory]:
         memories: list[Memory] = []
         for row in rows:
@@ -312,16 +331,14 @@ class SqliteMemoryStore:
 
         def _fetch() -> list[MemoryWithVector]:
             rows = db.execute(sql, params).fetchall()
-            results: list[MemoryWithVector] = []
-            for row in rows:
-                coactivation = self._get_coactivation(db, row["id"])
-                results.append(
-                    MemoryWithVector(
-                        memory=_row_to_memory(row, coactivation),
-                        vector=bytes(row["vector"]),
-                    )
+            coactivation_map = self._get_coactivation_map(db, [row["id"] for row in rows])
+            return [
+                MemoryWithVector(
+                    memory=_row_to_memory(row, coactivation_map.get(row["id"], ())),
+                    vector=bytes(row["vector"]),
                 )
-            return results
+                for row in rows
+            ]
 
         return await asyncio.to_thread(_fetch)
 
