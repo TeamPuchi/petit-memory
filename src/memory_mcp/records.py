@@ -15,6 +15,7 @@ from .store_backend import MemoryRecord
 from .types import (
     CameraPosition,
     Episode,
+    ForgetMarker,
     Memory,
     MemoryLink,
     SensoryData,
@@ -42,6 +43,15 @@ MEMORY_ATTRIBUTES: tuple[str, ...] = (
     "activation_count",
     "last_activated",
     "reading",
+    # 段2: 本人が決める 2 つの面。0/1 で持つ（DynamoDB の BOOL と SQLite の INTEGER を揃えるため）
+    "indexed",
+    "private",
+)
+
+FORGET_ATTRIBUTES: tuple[str, ...] = (
+    "memory_id",
+    "forgotten_at",
+    "reason",
 )
 
 EPISODE_ATTRIBUTES: tuple[str, ...] = (
@@ -131,6 +141,8 @@ def encode_memory(record: MemoryRecord) -> dict[str, Any]:
         "activation_count": memory.activation_count,
         "last_activated": memory.last_activated,
         "reading": record.reading,
+        "indexed": 1 if memory.indexed else 0,
+        "private": 1 if memory.private else 0,
     }
 
 
@@ -164,7 +176,19 @@ def decode_memory(
         activation_count=int(attrs["activation_count"] or 0),
         last_activated=attrs["last_activated"] or "",
         coactivation_weights=coactivation,
+        # 段2 より前に保管された行には列が無い。既定は「索引に載る・本人だけの面ではない」。
+        indexed=_as_flag(attrs.get("indexed"), default=True),
+        private=_as_flag(attrs.get("private"), default=False),
     )
+
+
+def _as_flag(value: Any, *, default: bool) -> bool:
+    """0/1・True/False・None を bool に揃える（古い行には列そのものが無い）。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return bool(int(value))
 
 
 # ── エピソード ──────────────────────────────
@@ -199,4 +223,24 @@ def decode_episode(attrs: Mapping[str, Any]) -> Episode:
         summary=attrs["summary"] or "",
         emotion=attrs["emotion"],
         importance=int(attrs["importance"]),
+    )
+
+
+# ── 消した跡 ────────────────────────────────
+
+
+def encode_forget_marker(marker: ForgetMarker) -> dict[str, Any]:
+    """保管用の属性辞書にする。本文は入れない（跡から中身が読めてはいけない）。"""
+    return {
+        "memory_id": marker.memory_id,
+        "forgotten_at": marker.forgotten_at,
+        "reason": marker.reason or None,
+    }
+
+
+def decode_forget_marker(attrs: Mapping[str, Any]) -> ForgetMarker:
+    return ForgetMarker(
+        memory_id=attrs["memory_id"],
+        forgotten_at=attrs["forgotten_at"],
+        reason=attrs["reason"] or None,
     )

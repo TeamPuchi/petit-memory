@@ -51,8 +51,8 @@ uv run memory-mcp
 | `MEMORY_ENABLE_BM25` | `true` | Enable BM25 hybrid re-ranking (`false` to disable) |
 | `PETIT_MEMORY_STORE` | `sqlite` | Storage backend (`sqlite` / `dynamo` / `dual`). `dual` writes to both, reads from SQLite |
 | `PETIT_MEMORY_DYNAMO_TABLE` | `house` | DynamoDB single-table name (used only with `dynamo` / `dual`) |
-| `PETIT_MEMORY_HOUSE_ID` | (empty) | House id in `pk = H#<hid>#P#<pid>` (used only with `dynamo` / `dual`) |
-| `PETIT_MEMORY_PETIT_ID` | (empty) | Petit id in `pk = H#<hid>#P#<pid>` (used only with `dynamo` / `dual`) |
+| `PETIT_MEMORY_HOUSE_ID` | (empty) | House id. **Empty gives `pk = P#<pid>`; a value gives the older `pk = H#<hid>#P#<pid>`** (used only with `dynamo` / `dual`) |
+| `PETIT_MEMORY_PETIT_ID` | (empty) | Petit id in the partition key (used only with `dynamo` / `dual`) |
 
 ## Claude Code integration
 
@@ -106,6 +106,11 @@ Save a memory to long-term storage.
   "category": "technical"
 }
 ```
+
+Two optional flags, both keeping the previous behaviour when omitted:
+
+- `index: false` — still saved, but left out of semantic search, `recall` and the random pick in the listing. It can still be read by ID
+- `private: true` — kept on the petit's own side (`PRIV#` in DynamoDB). It still shows up in the petit's own search and recall
 
 ### search_memories
 
@@ -164,7 +169,26 @@ List the most recent memories.
 ```json
 {
   "limit": 10,
-  "category_filter": "memory"
+  "category_filter": "memory",
+  "random": 1,
+  "neighbors": true
+}
+```
+
+- `random` (default `0`) — mix in this many unrelated memories, picked at random. Memories saved with `index: false` are never picked
+- `neighbors` (default `false`) — also show the memory just before and just after each one, in time order
+
+The listing also shows the traces of memories forgotten within the same stretch of time.
+
+### forget
+
+Forget a memory on purpose. **A forgotten memory cannot be brought back** — there is no restore tool.
+Only a trace stays in the listing: when, which id, and why. The content itself is not kept.
+
+```json
+{
+  "memory_id": "4f1c...",
+  "reason": "I do not want to carry this any more"
 }
 ```
 

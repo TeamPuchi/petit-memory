@@ -3,13 +3,17 @@
 ## 表の形
 
 - 表名: `house`（単一表・既定）。pk と sk の 2 本だけで、GSI は使わない。
-- `pk` = `H#<hid>#P#<pid>`   家 ID と、ぷち個体 ID
+- `pk` — 環境変数 `PETIT_MEMORY_HOUSE_ID` の有無で 2 通り（`partition_key` 1 か所で組み立てる）:
+  - 無ければ `P#<pid>`            アカウントが最上位・家はその下（9/22 の決定。これから作るクラウドぷち）
+  - あれば `H#<hid>#P#<pid>`      従来形（ぷちてゃたちと、既に書いた分）
 - `sk` の前置辞:
   - `MEM#<ts>#<id>`                  記憶本体（`ts` は ISO 8601 なので sk 昇順＝時系列順）
+  - `PRIV#<ts>#<id>`                 本人だけの面。本体と同じ形で、置き場所だけ分ける
+  - `FORGET#<ts>#<id>`               消した跡。本文は持たない（復元の道具を作らないため）
   - `VEC#<id>`                       記憶の埋め込みベクトル（Binary）
   - `EPI#<start_time>#<id>`          エピソード（sk 昇順＝開始時刻順）
   - `COACT#<source_id>#<target_id>`  共活性の重み（片方向 1 件。対称化は呼び出し側）
-  - `IDX#<memory_id>`                記憶の指し札。属性 `target_sk` に `MEM#<ts>#<id>`
+  - `IDX#<memory_id>`                記憶の指し札。属性 `target_sk` に `MEM#…` か `PRIV#…`
   - `IDX#EPI#<episode_id>`           エピソードの指し札。属性 `target_sk` に `EPI#<start_time>#<id>`
 
 `sk` に時刻が入る本体を ID だけで引くために、同じパーティションに「指し札」を置く。
@@ -19,10 +23,19 @@ pk が `id` になる GSI はその壁の外に出てしまう。
 指し札は本体と同じ pk なので、書き込みは `TransactWriteItems` で本体・ベクトル・指し札を
 1 回で束ねる。削除も同じ。
 
-## 段1 の範囲外（次の PR）
+## 本人だけの面（`PRIV#`）の読み
 
-`FORGET#`（消した跡）、`PRIV#`（本人だけの面）、`index:false`（非索引指定）、
-一覧ツールの `random` 1 件と前後。
+`PRIV#` は「置き場所を分ける」だけで、本人（MCP 経由）からの読みでは `MEM#` と同じに見える。
+記憶を一覧・検索する経路はすべて `_query_memories_sync()` を通り、2 つの前置辞を読んで
+`<ts>#<id>` 順に並べ直す。里親向けの読み出し経路はこの層には作らない
+（家 API に出さないのは呼び出し側の責任で、保管層に「`MEM#` だけ読む口」を生やすと
+そこが将来の抜け道になる）。
+
+## `index:false`
+
+`indexed` 属性が 0 の記憶は、意味検索の母集団（`fetch_memories_with_vectors`）と
+Hopfield の母集団（`fetch_all_vectors`）、無作為の 1 件の母集団
+（`fetch_indexed_memory_ids`）から外す。ID 指定の読みと新着一覧では従来どおり出る。
 """
 
 from __future__ import annotations
@@ -33,16 +46,27 @@ from decimal import Decimal
 from typing import Any
 
 from .config import MemoryConfig
-from .records import decode_episode, decode_memory, encode_episode, encode_memory, parse_linked_ids, parse_links
+from .records import (
+    decode_episode,
+    decode_forget_marker,
+    decode_memory,
+    encode_episode,
+    encode_forget_marker,
+    encode_memory,
+    parse_linked_ids,
+    parse_links,
+)
 from .store_backend import (
     MemoryFacets,
     MemoryRecord,
     MemoryWithVector,
     VectorRow,
 )
-from .types import Episode, Memory
+from .types import Episode, ForgetMarker, Memory
 
 MEMORY_PREFIX = "MEM#"
+PRIVATE_PREFIX = "PRIV#"
+FORGET_PREFIX = "FORGET#"
 VECTOR_PREFIX = "VEC#"
 EPISODE_PREFIX = "EPI#"
 COACTIVATION_PREFIX = "COACT#"
@@ -79,6 +103,19 @@ def _plain(item: dict[str, Any]) -> dict[str, Any]:
     return {key: _from_attribute(value) for key, value in item.items()}
 
 
+def _sk_suffix(sk: str) -> str:
+    """`MEM#<ts>#<id>` / `PRIV#<ts>#<id>` から `<ts>#<id>` を取る（並べ替えの鍵）。"""
+    return sk.split("#", 1)[1]
+
+
+def _is_indexed(item: dict[str, Any]) -> bool:
+    """`index:false` で保存された記憶か。段2 より前の行には属性が無いので既定は True。"""
+    value = item.get("indexed")
+    if value is None:
+        return True
+    return bool(int(value))
+
+
 class DynamoMemoryStore:
     """DynamoDB の単一表 `house` に記憶を置く保管層。
 
@@ -98,13 +135,30 @@ class DynamoMemoryStore:
 
     @property
     def partition_key(self) -> str:
-        """`H#<hid>#P#<pid>`。この家・この個体の記憶が 1 パーティションに入る。"""
+        """pk はここ 1 か所でしか組み立てない（切り替えの口）。
+
+        - `PETIT_MEMORY_HOUSE_ID` が無い（`house_id` が空）→ `P#<pid>`
+          9/22 の決定「アカウントが最上位、家はその下」に合わせた新しい形。
+          これから作るクラウドぷちはこちら。
+        - ある → `H#<hid>#P#<pid>`（従来形）
+
+        表の中身は pk ごとに完全に分かれるので、同じ個体で途中から切り替えると
+        前の pk に書いたものは読めなくなる。**動いている個体の環境変数は変えない。**
+        """
+        if not self._house_id:
+            return f"P#{self._petit_id}"
         return f"H#{self._house_id}#P#{self._petit_id}"
 
     @staticmethod
-    def memory_sk(timestamp: str, memory_id: str) -> str:
-        """`MEM#<ts>#<id>`。"""
-        return f"{MEMORY_PREFIX}{timestamp}#{memory_id}"
+    def memory_sk(timestamp: str, memory_id: str, private: bool = False) -> str:
+        """`MEM#<ts>#<id>`。本人だけの面なら `PRIV#<ts>#<id>`。"""
+        prefix = PRIVATE_PREFIX if private else MEMORY_PREFIX
+        return f"{prefix}{timestamp}#{memory_id}"
+
+    @staticmethod
+    def forget_sk(forgotten_at: str, memory_id: str) -> str:
+        """`FORGET#<ts>#<id>`。"""
+        return f"{FORGET_PREFIX}{forgotten_at}#{memory_id}"
 
     @staticmethod
     def vector_sk(memory_id: str) -> str:
@@ -179,6 +233,7 @@ class DynamoMemoryStore:
         forward: bool = True,
         sk_from: str | None = None,
         sk_to: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """`sk` 前置辞（必要なら範囲）で 1 パーティションを読む。ページングも面倒を見る。"""
         from boto3.dynamodb.conditions import Key
@@ -196,15 +251,48 @@ class DynamoMemoryStore:
             names = {f"#p{i}": name for i, name in enumerate(projection)}
             kwargs["ProjectionExpression"] = ", ".join(names)
             kwargs["ExpressionAttributeNames"] = names
+        if limit is not None:
+            kwargs["Limit"] = limit
 
         items: list[dict[str, Any]] = []
         while True:
             response = table.query(**kwargs)
             items.extend(response.get("Items", []))
+            if limit is not None and len(items) >= limit:
+                return items[:limit]
             last_key = response.get("LastEvaluatedKey")
             if not last_key:
                 return items
             kwargs["ExclusiveStartKey"] = last_key
+
+    def _query_memories_sync(
+        self,
+        *,
+        projection: list[str] | None = None,
+        forward: bool = True,
+        ts_from: str | None = None,
+        ts_to: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """記憶を `MEM#` と `PRIV#` の両方から読み、`<ts>#<id>` 順に並べ直す。
+
+        本人だけの面も本人から見れば同じ 1 本の時系列なので、記憶を一覧・走査する
+        経路はすべてここを通す。`sk` は並べ替えに要るので projection にも必ず足す。
+        """
+        if projection is not None and "sk" not in projection:
+            projection = [*projection, "sk"]
+
+        items: list[dict[str, Any]] = []
+        for prefix in (MEMORY_PREFIX, PRIVATE_PREFIX):
+            items.extend(
+                self._query_prefix_sync(
+                    prefix,
+                    projection=projection,
+                    sk_from=f"{prefix}{ts_from}" if ts_from else None,
+                    sk_to=f"{prefix}{ts_to}{_SK_MAX}" if ts_to else None,
+                )
+            )
+        items.sort(key=lambda item: _sk_suffix(str(item["sk"])), reverse=not forward)
+        return items
 
     def _get_item_sync(self, sk: str) -> dict[str, Any] | None:
         table = self._ensure_connected()
@@ -319,7 +407,7 @@ class DynamoMemoryStore:
 
     async def fetch_all_memories(self) -> list[Memory]:
         def _fetch() -> list[Memory]:
-            items = self._query_prefix_sync(MEMORY_PREFIX)
+            items = self._query_memories_sync()
             coactivation = self._coactivation_map_sync()
             return [
                 decode_memory(_plain(item), coactivation.get(item["id"], ()))
@@ -339,14 +427,14 @@ class DynamoMemoryStore:
 
         def _fetch() -> list[MemoryWithVector]:
             # 期間は sk の範囲で粗く絞り、境界の比較は SQLite と同じ文字列比較で仕上げる
-            sk_from = f"{MEMORY_PREFIX}{date_from}" if date_from else None
-            sk_to = f"{MEMORY_PREFIX}{date_to}{_SK_MAX}" if date_to else None
-            items = self._query_prefix_sync(MEMORY_PREFIX, sk_from=sk_from, sk_to=sk_to)
+            items = self._query_memories_sync(ts_from=date_from, ts_to=date_to)
 
             selected = [
                 item
                 for item in items
-                if (emotion is None or item.get("emotion") == emotion)
+                # 段2: index:false は意味検索・recall の母集団に入れない
+                if _is_indexed(item)
+                and (emotion is None or item.get("emotion") == emotion)
                 and (category is None or item.get("category") == category)
                 and (date_from is None or str(item["timestamp"]) >= date_from)
                 and (date_to is None or str(item["timestamp"]) <= date_to)
@@ -380,7 +468,7 @@ class DynamoMemoryStore:
         """`sk` 降順（`ScanIndexForward=False`）に読んで、先頭 limit 件。"""
 
         def _fetch() -> list[Memory]:
-            items = self._query_prefix_sync(MEMORY_PREFIX, forward=False)
+            items = self._query_memories_sync(forward=False)
             if category:
                 items = [item for item in items if item.get("category") == category]
             items = items[: max(0, limit)]
@@ -400,7 +488,7 @@ class DynamoMemoryStore:
         limit: int,
     ) -> list[Memory]:
         def _fetch() -> list[Memory]:
-            items = self._query_prefix_sync(MEMORY_PREFIX)
+            items = self._query_memories_sync()
             selected = [
                 item
                 for item in items
@@ -420,8 +508,8 @@ class DynamoMemoryStore:
 
     async def fetch_memory_facets(self) -> MemoryFacets:
         def _fetch() -> MemoryFacets:
-            items = self._query_prefix_sync(
-                MEMORY_PREFIX, projection=["emotion", "category", "timestamp"]
+            items = self._query_memories_sync(
+                projection=["emotion", "category", "timestamp"]
             )
             rows = tuple(
                 (
@@ -443,10 +531,13 @@ class DynamoMemoryStore:
     # ── 記憶: 入れる・直す・消す ────────────────
 
     async def insert_memory(self, record: MemoryRecord) -> None:
-        """`MEM#<ts>#<id>`・`VEC#<id>`・`IDX#<id>` を 1 トランザクションで書く。"""
+        """`MEM#<ts>#<id>`（本人だけの面なら `PRIV#…`）・`VEC#<id>`・`IDX#<id>` を 1 トランザクションで書く。
+
+        指し札は置き場所に関わらず `IDX#<id>` なので、ID 指定の読みは 2 つの面で同じ。
+        """
         memory = record.memory
         attrs = {key: _to_attribute(value) for key, value in encode_memory(record).items()}
-        memory_sk = self.memory_sk(memory.timestamp, memory.id)
+        memory_sk = self.memory_sk(memory.timestamp, memory.id, memory.private)
 
         def _write() -> None:
             self._transact_write_sync(
@@ -517,10 +608,11 @@ class DynamoMemoryStore:
 
         await asyncio.to_thread(_update)
 
-    async def delete_memory(self, memory_id: str) -> bool:
-        """`MEM#`・`VEC#`・`IDX#`・その記憶に触れる `COACT#` を消し、逆参照も掃除する。
+    async def delete_memory(self, memory_id: str, forget_marker: ForgetMarker | None = None) -> bool:
+        """`MEM#`（か `PRIV#`）・`VEC#`・`IDX#`・その記憶に触れる `COACT#` を消し、逆参照も掃除する。
 
-        段1 の範囲外だが、設計では消した跡を `FORGET#` に残す。
+        `forget_marker` を渡すと、同じ `TransactWriteItems` で `FORGET#<ts>#<id>` を書く。
+        跡には本文を入れないので、これを読んでも記憶は戻らない。
         """
 
         def _delete() -> bool:
@@ -531,7 +623,7 @@ class DynamoMemoryStore:
             table = self._ensure_connected()
 
             # 他の記憶の linked_ids / links から消す
-            for item in self._query_prefix_sync(MEMORY_PREFIX):
+            for item in self._query_memories_sync():
                 if item["id"] == memory_id:
                     continue
                 updates: dict[str, Any] = {}
@@ -563,6 +655,24 @@ class DynamoMemoryStore:
             for item in self._query_prefix_sync(COACTIVATION_PREFIX):
                 if item["source_id"] == memory_id or item["target_id"] == memory_id:
                     deletes.append({"Delete": self._key(item["sk"])})
+
+            if forget_marker is not None:
+                marker_attrs = {
+                    key: _to_attribute(value)
+                    for key, value in encode_forget_marker(forget_marker).items()
+                }
+                deletes.append(
+                    {
+                        "Put": {
+                            **self._key(
+                                self.forget_sk(forget_marker.forgotten_at, memory_id)
+                            ),
+                            "entity": "forget",
+                            **marker_attrs,
+                        }
+                    }
+                )
+
             self._transact_write_sync(deletes)
             return True
 
@@ -590,6 +700,82 @@ class DynamoMemoryStore:
 
         await asyncio.to_thread(_link)
 
+    # ── 消した跡 ────────────────────────────────
+
+    async def fetch_forget_markers(self, since: str | None, limit: int) -> list[ForgetMarker]:
+        """`FORGET#` を降順（新しい順）に読む。`since` は sk の下端で切る。"""
+
+        def _fetch() -> list[ForgetMarker]:
+            items = self._query_prefix_sync(
+                FORGET_PREFIX,
+                forward=False,
+                sk_from=f"{FORGET_PREFIX}{since}" if since else None,
+                limit=max(0, limit) or None,
+            )
+            return [decode_forget_marker(_plain(item)) for item in items[: max(0, limit)]]
+
+        return await asyncio.to_thread(_fetch)
+
+    # ── 一覧の材料（段2）──────────────────────
+
+    async def fetch_indexed_memory_ids(self) -> list[str]:
+        """無作為の 1 件を選ぶための母集団。ID だけを射影して読む。"""
+
+        def _fetch() -> list[str]:
+            items = self._query_memories_sync(projection=["id", "indexed"])
+            return [item["id"] for item in items if _is_indexed(item)]
+
+        return await asyncio.to_thread(_fetch)
+
+    async def fetch_neighbors(self, memory_id: str) -> tuple[Memory | None, Memory | None]:
+        """`<ts>#<id>` 順で 1 つ前・1 つ後。`MEM#` と `PRIV#` の両方を見て近いほうを採る。
+
+        `between` は両端を含むので、錨そのものが混ざる分だけ 2 件ずつ読んで落とす。
+        """
+
+        def _fetch() -> tuple[Memory | None, Memory | None]:
+            anchor_sk = self._resolve_memory_sk_sync(memory_id)
+            if anchor_sk is None:
+                return (None, None)
+            suffix = _sk_suffix(anchor_sk)
+
+            def _pick(before: bool) -> dict[str, Any] | None:
+                best: dict[str, Any] | None = None
+                for prefix in (MEMORY_PREFIX, PRIVATE_PREFIX):
+                    bound = f"{prefix}{suffix}"
+                    items = self._query_prefix_sync(
+                        prefix,
+                        forward=not before,
+                        sk_from=None if before else bound,
+                        sk_to=bound if before else None,
+                        limit=2,
+                    )
+                    for item in items:
+                        candidate = _sk_suffix(str(item["sk"]))
+                        if candidate == suffix:
+                            continue
+                        if best is None:
+                            best = item
+                        else:
+                            current = _sk_suffix(str(best["sk"]))
+                            if (candidate > current) if before else (candidate < current):
+                                best = item
+                        break
+                return best
+
+            previous_item = _pick(before=True)
+            next_item = _pick(before=False)
+            coactivation = self._coactivation_map_sync()
+
+            def _decode(item: dict[str, Any] | None) -> Memory | None:
+                if item is None:
+                    return None
+                return decode_memory(_plain(item), coactivation.get(item["id"], ()))
+
+            return (_decode(previous_item), _decode(next_item))
+
+        return await asyncio.to_thread(_fetch)
+
     # ── ベクトル ────────────────────────────────
 
     async def fetch_vectors(self, memory_ids: list[str]) -> dict[str, bytes]:
@@ -605,11 +791,13 @@ class DynamoMemoryStore:
     async def fetch_all_vectors(self) -> list[VectorRow]:
         def _fetch() -> list[VectorRow]:
             vectors = self._query_prefix_sync(VECTOR_PREFIX)
+            # 段2: index:false は Hopfield の母集団にも載せない
             contents = {
                 item["id"]: item.get("normalized_content", "")
-                for item in self._query_prefix_sync(
-                    MEMORY_PREFIX, projection=["id", "normalized_content"]
+                for item in self._query_memories_sync(
+                    projection=["id", "normalized_content", "indexed"]
                 )
+                if _is_indexed(item)
             }
             rows: list[VectorRow] = []
             for item in vectors:

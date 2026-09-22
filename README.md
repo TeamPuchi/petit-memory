@@ -51,8 +51,8 @@ uv run memory-mcp
 | `MEMORY_ENABLE_BM25` | `true` | BM25ハイブリッド再ランキングを有効化(`false`で無効) |
 | `PETIT_MEMORY_STORE` | `sqlite` | 保管層の実装(`sqlite` / `dynamo` / `dual`)。`dual` は書きが2枚・読みはSQLite |
 | `PETIT_MEMORY_DYNAMO_TABLE` | `house` | DynamoDB 単一表の表名(`dynamo` / `dual` のときだけ使う) |
-| `PETIT_MEMORY_HOUSE_ID` | (空) | `pk = H#<hid>#P#<pid>` の家ID(`dynamo` / `dual` のときだけ使う) |
-| `PETIT_MEMORY_PETIT_ID` | (空) | `pk = H#<hid>#P#<pid>` の個体ID(`dynamo` / `dual` のときだけ使う) |
+| `PETIT_MEMORY_HOUSE_ID` | (空) | 家ID。**空なら `pk = P#<pid>`、値があれば従来形の `pk = H#<hid>#P#<pid>`**(`dynamo` / `dual` のときだけ使う) |
+| `PETIT_MEMORY_PETIT_ID` | (空) | pk の個体ID(`dynamo` / `dual` のときだけ使う) |
 
 ## Claude Code連携
 
@@ -106,6 +106,11 @@ uv remove --dev chromadb
   "category": "technical"
 }
 ```
+
+任意で `index` と `private` を指定できます(どちらも省略時は従来どおり)。
+
+- `index: false` — 保存はするが、意味検索・`recall`・一覧の無作為1件の対象から外す。ID指定では取り出せる
+- `private: true` — 本人だけの面に置く(DynamoDB では `PRIV#`)。本人の検索・想起には出る
 
 ### search_memories
 
@@ -164,7 +169,26 @@ uv remove --dev chromadb
 ```json
 {
   "limit": 10,
-  "category_filter": "memory"
+  "category_filter": "memory",
+  "random": 1,
+  "neighbors": true
+}
+```
+
+- `random` (既定 `0`) — 新着とは関係ない記憶を無作為に混ぜる数。`index: false` の記憶は混ざらない
+- `neighbors` (既定 `false`) — 各件の時系列で前後1件を添える
+
+一覧には、同じ時間の幅に入る「消した跡」(`forget` した記録)も併せて出ます。
+
+### forget
+
+記憶を意図して消します。**消した記憶は戻せません**(復元ツールはありません)。
+一覧には「いつ・どのIDを・なぜ消したか」の跡だけが残り、本文は残りません。
+
+```json
+{
+  "memory_id": "4f1c...",
+  "reason": "もう抱えていたくない"
 }
 ```
 

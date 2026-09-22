@@ -20,7 +20,7 @@ from .store_backend import (
     MemoryWithVector,
     VectorRow,
 )
-from .types import Episode, Memory
+from .types import Episode, ForgetMarker, Memory
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +179,15 @@ class DualWriteMemoryStore:
     async def fetch_all_episodes(self) -> list[Episode]:
         return await self._primary.fetch_all_episodes()
 
+    async def fetch_forget_markers(self, since: str | None, limit: int) -> list[ForgetMarker]:
+        return await self._primary.fetch_forget_markers(since, limit)
+
+    async def fetch_indexed_memory_ids(self) -> list[str]:
+        return await self._primary.fetch_indexed_memory_ids()
+
+    async def fetch_neighbors(self, memory_id: str) -> tuple[Memory | None, Memory | None]:
+        return await self._primary.fetch_neighbors(memory_id)
+
     # ── 書き: 2 枚へ ────────────────────────────
 
     async def insert_memory(self, record: MemoryRecord) -> None:
@@ -199,9 +208,9 @@ class DualWriteMemoryStore:
         await self._primary.increment_access(memory_id, last_accessed)
         await self._replicate("increment_access", memory_id, last_accessed)
 
-    async def delete_memory(self, memory_id: str) -> bool:
-        result = await self._primary.delete_memory(memory_id)
-        await self._replicate("delete_memory", memory_id)
+    async def delete_memory(self, memory_id: str, forget_marker: ForgetMarker | None = None) -> bool:
+        result = await self._primary.delete_memory(memory_id, forget_marker)
+        await self._replicate("delete_memory", memory_id, forget_marker)
         return result
 
     async def add_bidirectional_link(self, source_id: str, target_id: str) -> None:

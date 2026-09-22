@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import random
 import uuid
 from datetime import datetime
 from typing import Any
@@ -44,10 +45,13 @@ from .store_backend import (
 from .types import (
     CameraPosition,
     Episode,
+    ForgetMarker,
     Memory,
     MemoryLink,
     MemorySearchResult,
     MemoryStats,
+    RecentListing,
+    RecentMemoryEntry,
     ScoredMemory,
     SensoryData,
 )
@@ -172,8 +176,14 @@ class MemoryStore:
         sensory_data: tuple[SensoryData, ...] = (),
         camera_position: CameraPosition | None = None,
         tags: tuple[str, ...] = (),
+        indexed: bool = True,
+        private: bool = False,
     ) -> Memory:
-        """Save a new memory."""
+        """Save a new memory.
+
+        段2: `indexed=False` なら意味検索・recall・random の母集団から外す（ID 指定では取れる）。
+        `private=True` なら本人だけの面に置く（DynamoDB では `PRIV#`）。
+        """
         memory_id = str(uuid.uuid4())
         timestamp = datetime.now().isoformat()
         importance = max(1, min(5, importance))
@@ -189,6 +199,8 @@ class MemoryStore:
             sensory_data=sensory_data,
             camera_position=camera_position,
             tags=tags,
+            indexed=indexed,
+            private=private,
         )
 
         normalized_content = normalize_japanese(content)
@@ -397,6 +409,54 @@ class MemoryStore:
         """List recent memories sorted by timestamp descending."""
         return await self._backend.fetch_recent_memories(limit=limit, category=category_filter)
 
+    async def list_recent_listing(
+        self,
+        limit: int = 10,
+        category_filter: str | None = None,
+        random_count: int = 0,
+        neighbors: bool = False,
+    ) -> RecentListing:
+        """新着一覧に「無作為の 1 件」と「前後の記憶」と「消した跡」を添える（段2）。
+
+        - `random_count` — 新着とは関係ない記憶を無作為に混ぜる数。
+          母集団は索引に載っている記憶（`index:false` は混ざらない）から、
+          既に一覧に出ている分を除いたもの。選ぶのは計算なのでここでやる。
+        - `neighbors` — 各件の時系列で前後 1 件ずつを添える。
+        - 消した跡は、一覧に出た一番古い記憶より新しいものだけを返す
+          （一覧と同じ窓に収める。跡だけが延々と並ばないように）。
+        """
+        recent = await self._backend.fetch_recent_memories(limit=limit, category=category_filter)
+        entries: list[RecentMemoryEntry] = [
+            RecentMemoryEntry(memory=m, kind="recent") for m in recent
+        ]
+
+        if random_count > 0:
+            shown = {m.id for m in recent}
+            pool = [mid for mid in await self._backend.fetch_indexed_memory_ids() if mid not in shown]
+            if pool:
+                picked = random.sample(pool, min(random_count, len(pool)))
+                for memory in await self._backend.fetch_memories(picked):
+                    entries.append(RecentMemoryEntry(memory=memory, kind="random"))
+
+        if neighbors:
+            with_neighbors: list[RecentMemoryEntry] = []
+            for entry in entries:
+                previous, following = await self._backend.fetch_neighbors(entry.memory.id)
+                with_neighbors.append(
+                    RecentMemoryEntry(
+                        memory=entry.memory,
+                        kind=entry.kind,
+                        previous=previous,
+                        next=following,
+                    )
+                )
+            entries = with_neighbors
+
+        since = recent[-1].timestamp if recent else None
+        forgotten = await self._backend.fetch_forget_markers(since, max(limit, 1))
+
+        return RecentListing(entries=tuple(entries), forgotten=tuple(forgotten))
+
     # ── get_stats ───────────────────────────────
 
     async def get_stats(self) -> MemoryStats:
@@ -443,12 +503,40 @@ class MemoryStore:
 
     # ── delete_memory ──────────────────────────
 
-    async def delete_memory(self, memory_id: str) -> bool:
-        """Delete a memory and clean up references."""
-        result = await self._backend.delete_memory(memory_id)
+    async def delete_memory(
+        self,
+        memory_id: str,
+        *,
+        reason: str | None = None,
+        leave_trace: bool = True,
+    ) -> bool:
+        """Delete a memory and clean up references.
+
+        段2: 既定で「消した跡」（`ForgetMarker`）を残す。跡に本文は入らないので、
+        これを読んでも記憶は戻らない。復元のためのツールは作らない。
+
+        `leave_trace=False` は統合（`merge_memories`）用。あちらは忘却ではなく、
+        中身が新しい 1 件に引き継がれるので跡を残さない。
+        """
+        marker = (
+            ForgetMarker(
+                memory_id=memory_id,
+                forgotten_at=datetime.now().isoformat(),
+                reason=reason,
+            )
+            if leave_trace
+            else None
+        )
+        result = await self._backend.delete_memory(memory_id, marker)
         if result:
             self._bm25_index.mark_dirty()
         return result
+
+    # ── forget_markers ─────────────────────────
+
+    async def list_forget_markers(self, since: str | None = None, limit: int = 10) -> list[ForgetMarker]:
+        """消した跡を新しい順に取る。"""
+        return await self._backend.fetch_forget_markers(since, limit)
 
     # ── merge_memories ─────────────────────────
 
@@ -507,9 +595,9 @@ class MemoryStore:
                 linked_ids=linked_ids_str,
             )
 
-        # Delete source memories
+        # Delete source memories（統合は忘却ではないので跡は残さない）
         for sid in source_ids:
-            await self.delete_memory(sid)
+            await self.delete_memory(sid, leave_trace=False)
 
         return new_memory
 
@@ -610,6 +698,8 @@ class MemoryStore:
         category: str = "daily",
         link_threshold: float = 0.8,
         max_links: int = 5,
+        indexed: bool = True,
+        private: bool = False,
     ) -> Memory:
         similar_memories = await self.search(query=content, n_results=max_links)
         memories_to_link = [r.memory for r in similar_memories if r.distance <= link_threshold]
@@ -627,6 +717,8 @@ class MemoryStore:
             importance=importance,
             category=category,
             linked_ids=linked_ids,
+            indexed=indexed,
+            private=private,
         )
 
         normalized_content = normalize_japanese(content)
