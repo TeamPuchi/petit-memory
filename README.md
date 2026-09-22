@@ -49,10 +49,10 @@ uv run memory-mcp
 | `MEMORY_COLLECTION_NAME` | `claude_memories` | コレクション名(メタデータとして保存) |
 | `MEMORY_EMBEDDING_MODEL` | `intfloat/multilingual-e5-base` | 埋め込みに使うsentence-transformersモデル |
 | `MEMORY_ENABLE_BM25` | `true` | BM25ハイブリッド再ランキングを有効化(`false`で無効) |
-| `PETIT_MEMORY_STORE` | `sqlite` | 保管層の実装(`sqlite` / `dynamo`)。`dynamo` は骨組みのみで未実装 |
-| `PETIT_MEMORY_DYNAMO_TABLE` | `house` | DynamoDB 単一表の表名(`dynamo` のときだけ使う) |
-| `PETIT_MEMORY_HOUSE_ID` | (空) | `pk = H#<hid>#P#<pid>` の家ID(`dynamo` のときだけ使う) |
-| `PETIT_MEMORY_PETIT_ID` | (空) | `pk = H#<hid>#P#<pid>` の個体ID(`dynamo` のときだけ使う) |
+| `PETIT_MEMORY_STORE` | `sqlite` | 保管層の実装(`sqlite` / `dynamo` / `dual`)。`dual` は書きが2枚・読みはSQLite |
+| `PETIT_MEMORY_DYNAMO_TABLE` | `house` | DynamoDB 単一表の表名(`dynamo` / `dual` のときだけ使う) |
+| `PETIT_MEMORY_HOUSE_ID` | (空) | `pk = H#<hid>#P#<pid>` の家ID(`dynamo` / `dual` のときだけ使う) |
+| `PETIT_MEMORY_PETIT_ID` | (空) | `pk = H#<hid>#P#<pid>` の個体ID(`dynamo` / `dual` のときだけ使う) |
 
 ## Claude Code連携
 
@@ -414,7 +414,9 @@ m5-petit-memory/
 │   ├── store.py        # MemoryStore(計算層: 類似度・減衰・ブースト・再ランク・想起)
 │   ├── store_backend.py # 保管層の抽象(MemoryStoreBackend)と実装の選択
 │   ├── sqlite_backend.py # SqliteMemoryStore(既定の保管層)
-│   ├── dynamo_backend.py # DynamoMemoryStore(段0では骨組みのみ)
+│   ├── dynamo_backend.py # DynamoMemoryStore(単一表 house)
+│   ├── dual_backend.py  # DualWriteMemoryStore(段1: 書きは2枚・読みはSQLite)
+│   ├── records.py       # 記憶・エピソードの直列化(2つの実装で共通)
 │   ├── vector.py       # numpyコサイン類似度ユーティリティ
 │   ├── embedding.py    # intfloat/multilingual-e5-base 埋め込み
 │   ├── bm25.py         # ハイブリッド再ランキング用バイグラムBM25インデックス
