@@ -17,6 +17,12 @@ class MemoryConfig:
     collection_name: str
     embedding_model: str = "intfloat/multilingual-e5-base"
     enable_bm25: bool = True
+    # 段0: 保管層の選択（sqlite | dynamo）。既定は sqlite。
+    store_backend: str = "sqlite"
+    # DynamoDB 単一表の設定（store_backend="dynamo" のときだけ使う）
+    dynamo_table: str = "house"
+    house_id: str = ""
+    petit_id: str = ""
 
     @classmethod
     def from_env(cls) -> "MemoryConfig":
@@ -28,6 +34,10 @@ class MemoryConfig:
             collection_name=os.getenv("MEMORY_COLLECTION_NAME", "claude_memories"),
             embedding_model=os.getenv("MEMORY_EMBEDDING_MODEL", "intfloat/multilingual-e5-base"),
             enable_bm25=os.getenv("MEMORY_ENABLE_BM25", "true").lower() != "false",
+            store_backend=os.getenv("PETIT_MEMORY_STORE", "sqlite"),
+            dynamo_table=os.getenv("PETIT_MEMORY_DYNAMO_TABLE", "house"),
+            house_id=os.getenv("PETIT_MEMORY_HOUSE_ID", ""),
+            petit_id=os.getenv("PETIT_MEMORY_PETIT_ID", ""),
         )
 
 

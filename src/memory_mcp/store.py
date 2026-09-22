@@ -1,11 +1,17 @@
-"""SQLite + numpy backed memory storage (Phase 11: ChromaDB → SQLite+numpy)."""
+"""記憶の計算層（段0: 保管は store_backend.MemoryStoreBackend 越し）。
+
+このモジュールに残っているのは「計算」——埋め込み・cosine・時間減衰・
+感情/重要度ブースト・BM25 再ランク・Hopfield・連想拡散・グラフ探索。
+行の出し入れは `self._backend`（SQLite か DynamoDB）が担う。
+
+`MemoryStore` の公開メソッド・引数・戻り値は段0 で変えていない。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import math
-import sqlite3
 import uuid
 from datetime import datetime
 from typing import Any
@@ -29,6 +35,12 @@ from .predictive import (
     calculate_novelty_score,
     calculate_prediction_error,
 )
+from .store_backend import (
+    UPDATABLE_FIELDS,
+    MemoryRecord,
+    MemoryStoreBackend,
+    create_backend,
+)
 from .types import (
     CameraPosition,
     Episode,
@@ -46,66 +58,6 @@ from .workspace import (
     diversity_score,
     select_workspace_candidates,
 )
-
-# ──────────────────────────────────────────────
-# DDL
-# ──────────────────────────────────────────────
-
-_DDL = """
-CREATE TABLE IF NOT EXISTS memories (
-    id TEXT PRIMARY KEY,
-    content TEXT NOT NULL,
-    normalized_content TEXT NOT NULL,
-    timestamp TEXT NOT NULL,
-    emotion TEXT NOT NULL DEFAULT 'neutral',
-    importance INTEGER NOT NULL DEFAULT 3,
-    category TEXT NOT NULL DEFAULT 'daily',
-    access_count INTEGER NOT NULL DEFAULT 0,
-    last_accessed TEXT NOT NULL DEFAULT '',
-    linked_ids TEXT NOT NULL DEFAULT '',
-    episode_id TEXT,
-    sensory_data TEXT NOT NULL DEFAULT '',
-    camera_position TEXT,
-    tags TEXT NOT NULL DEFAULT '',
-    links TEXT NOT NULL DEFAULT '',
-    novelty_score REAL NOT NULL DEFAULT 0.0,
-    prediction_error REAL NOT NULL DEFAULT 0.0,
-    activation_count INTEGER NOT NULL DEFAULT 0,
-    last_activated TEXT NOT NULL DEFAULT '',
-    reading TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_memories_emotion    ON memories(emotion);
-CREATE INDEX IF NOT EXISTS idx_memories_category   ON memories(category);
-CREATE INDEX IF NOT EXISTS idx_memories_timestamp  ON memories(timestamp);
-CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
-
-CREATE TABLE IF NOT EXISTS embeddings (
-    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-    vector BLOB NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS coactivation (
-    source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    weight REAL NOT NULL CHECK(weight >= 0.0 AND weight <= 1.0),
-    PRIMARY KEY (source_id, target_id)
-);
-CREATE INDEX IF NOT EXISTS idx_coactivation_source ON coactivation(source_id);
-CREATE INDEX IF NOT EXISTS idx_coactivation_target ON coactivation(target_id);
-
-CREATE TABLE IF NOT EXISTS episodes (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    start_time TEXT NOT NULL,
-    end_time TEXT,
-    memory_ids TEXT NOT NULL DEFAULT '',
-    participants TEXT NOT NULL DEFAULT '',
-    location_context TEXT,
-    summary TEXT NOT NULL DEFAULT '',
-    emotion TEXT NOT NULL DEFAULT 'neutral',
-    importance INTEGER NOT NULL DEFAULT 3
-);
-"""
 
 # ──────────────────────────────────────────────
 # Score helpers (shared with memory.py callers)
@@ -168,110 +120,16 @@ def calculate_final_score(
 
 
 # ──────────────────────────────────────────────
-# Row → Memory helpers
-# ──────────────────────────────────────────────
-
-
-def _parse_linked_ids(linked_ids_str: str) -> tuple[str, ...]:
-    if not linked_ids_str:
-        return ()
-    return tuple(id.strip() for id in linked_ids_str.split(",") if id.strip())
-
-
-def _parse_sensory_data(sensory_data_json: str) -> tuple[SensoryData, ...]:
-    if not sensory_data_json:
-        return ()
-    try:
-        data_list = json.loads(sensory_data_json)
-        return tuple(SensoryData.from_dict(d) for d in data_list)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return ()
-
-
-def _parse_camera_position(camera_position_json: str | None) -> CameraPosition | None:
-    if not camera_position_json:
-        return None
-    try:
-        data = json.loads(camera_position_json)
-        return CameraPosition.from_dict(data)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return None
-
-
-def _parse_tags(tags_str: str) -> tuple[str, ...]:
-    if not tags_str:
-        return ()
-    return tuple(tag.strip() for tag in tags_str.split(",") if tag.strip())
-
-
-def _parse_links(links_json: str) -> tuple[MemoryLink, ...]:
-    if not links_json:
-        return ()
-    try:
-        data_list = json.loads(links_json)
-        return tuple(MemoryLink.from_dict(d) for d in data_list)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return ()
-
-
-def _row_to_memory(row: sqlite3.Row, coactivation: tuple[tuple[str, float], ...] = ()) -> Memory:
-    """Convert a SQLite Row from the memories table to a Memory object."""
-    episode_id_raw = row["episode_id"]
-    episode_id = episode_id_raw if episode_id_raw else None
-
-    return Memory(
-        id=row["id"],
-        content=row["content"],
-        timestamp=row["timestamp"],
-        emotion=row["emotion"],
-        importance=row["importance"],
-        category=row["category"],
-        access_count=row["access_count"],
-        last_accessed=row["last_accessed"] or "",
-        linked_ids=_parse_linked_ids(row["linked_ids"] or ""),
-        episode_id=episode_id,
-        sensory_data=_parse_sensory_data(row["sensory_data"] or ""),
-        camera_position=_parse_camera_position(row["camera_position"]),
-        tags=_parse_tags(row["tags"] or ""),
-        links=_parse_links(row["links"] or ""),
-        novelty_score=float(row["novelty_score"] or 0.0),
-        prediction_error=float(row["prediction_error"] or 0.0),
-        activation_count=int(row["activation_count"] or 0),
-        last_activated=row["last_activated"] or "",
-        coactivation_weights=coactivation,
-    )
-
-
-def _row_to_episode(row: sqlite3.Row) -> Episode:
-    """Convert a SQLite Row from the episodes table to an Episode object."""
-    memory_ids_raw = row["memory_ids"] or ""
-    participants_raw = row["participants"] or ""
-    return Episode(
-        id=row["id"],
-        title=row["title"],
-        start_time=row["start_time"],
-        end_time=row["end_time"] or None,
-        memory_ids=tuple(memory_ids_raw.split(",") if memory_ids_raw else []),
-        participants=tuple(participants_raw.split(",") if participants_raw else []),
-        location_context=row["location_context"] or None,
-        summary=row["summary"] or "",
-        emotion=row["emotion"],
-        importance=int(row["importance"]),
-    )
-
-
-# ──────────────────────────────────────────────
 # MemoryStore
 # ──────────────────────────────────────────────
 
 
 class MemoryStore:
-    """SQLite + numpy memory storage (Phase 11)."""
+    """記憶の計算層。保管は `MemoryStoreBackend` に委ねる。"""
 
-    def __init__(self, config: MemoryConfig):
+    def __init__(self, config: MemoryConfig, backend: MemoryStoreBackend | None = None):
         self._config = config
-        self._db: sqlite3.Connection | None = None
-        self._lock = asyncio.Lock()
+        self._backend: MemoryStoreBackend = backend or create_backend(config)
         self._working_memory = WorkingMemoryBuffer(capacity=20)
         self._association_engine = AssociationEngine()
         self._consolidation_engine = ConsolidationEngine()
@@ -282,36 +140,32 @@ class MemoryStore:
     # ── Connection ──────────────────────────────
 
     async def connect(self) -> None:
-        """Open SQLite database and create tables."""
-        async with self._lock:
-            if self._db is None:
-                db_path = self._config.db_path
-
-                def _open() -> sqlite3.Connection:
-                    conn = sqlite3.connect(db_path, check_same_thread=False)
-                    conn.row_factory = sqlite3.Row
-                    conn.execute("PRAGMA foreign_keys = ON")
-                    conn.execute("PRAGMA journal_mode = WAL")
-                    for stmt in _DDL.strip().split(";"):
-                        stmt = stmt.strip()
-                        if stmt:
-                            conn.execute(stmt)
-                    conn.commit()
-                    return conn
-
-                self._db = await asyncio.to_thread(_open)
+        """Open the backing store."""
+        await self._backend.connect()
 
     async def disconnect(self) -> None:
-        """Close the SQLite connection."""
-        async with self._lock:
-            if self._db is not None:
-                await asyncio.to_thread(self._db.close)
-                self._db = None
+        """Close the backing store."""
+        await self._backend.disconnect()
 
-    def _ensure_connected(self) -> sqlite3.Connection:
-        if self._db is None:
-            raise RuntimeError("MemoryStore not connected. Call connect() first.")
-        return self._db
+    @property
+    def backend(self) -> MemoryStoreBackend:
+        """保管層。段1 以降で差し替える対象。"""
+        return self._backend
+
+    def _ensure_connected(self) -> Any:
+        """生の SQLite 接続を返す互換用の逃げ道（テストのみが使う）。
+
+        SQLite 以外の保管層では使えない。段1 以降でテスト側に
+        書き込みヘルパを用意して消す。
+        """
+        from .sqlite_backend import SqliteMemoryStore
+
+        if not isinstance(self._backend, SqliteMemoryStore):
+            raise RuntimeError(
+                "_ensure_connected() is SQLite-only; "
+                f"current backend is {type(self._backend).__name__}"
+            )
+        return self._backend.connection
 
     # ── Embedding helpers ───────────────────────
 
@@ -320,37 +174,6 @@ class MemoryStore:
 
     async def _encode_query(self, text: str) -> list[float]:
         return (await asyncio.to_thread(self._embedding_fn.encode_query, [text]))[0]
-
-    # ── Coactivation helpers ────────────────────
-
-    def _get_coactivation(self, db: sqlite3.Connection, memory_id: str) -> tuple[tuple[str, float], ...]:
-        rows = db.execute(
-            "SELECT target_id, weight FROM coactivation WHERE source_id = ?",
-            (memory_id,),
-        ).fetchall()
-        return tuple((row["target_id"], float(row["weight"])) for row in rows)
-
-    # ── Fetch helpers ───────────────────────────
-
-    def _fetch_memory_by_id(self, db: sqlite3.Connection, memory_id: str) -> Memory | None:
-        row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        if row is None:
-            return None
-        coactivation = self._get_coactivation(db, memory_id)
-        return _row_to_memory(row, coactivation)
-
-    def _fetch_memories_by_ids_sync(self, db: sqlite3.Connection, memory_ids: list[str]) -> list[Memory]:
-        if not memory_ids:
-            return []
-        placeholders = ",".join("?" * len(memory_ids))
-        rows = db.execute(
-            f"SELECT * FROM memories WHERE id IN ({placeholders})", memory_ids
-        ).fetchall()
-        memories: list[Memory] = []
-        for row in rows:
-            coactivation = self._get_coactivation(db, row["id"])
-            memories.append(_row_to_memory(row, coactivation))
-        return memories
 
     # ── Save ────────────────────────────────────
 
@@ -366,7 +189,6 @@ class MemoryStore:
         tags: tuple[str, ...] = (),
     ) -> Memory:
         """Save a new memory."""
-        db = self._ensure_connected()
         memory_id = str(uuid.uuid4())
         timestamp = datetime.now().isoformat()
         importance = max(1, min(5, importance))
@@ -390,34 +212,14 @@ class MemoryStore:
         embedding = await self._encode_document(normalized_content)
         vector_blob = encode_vector(embedding)
 
-        def _insert() -> None:
-            meta = memory.to_metadata()
-            db.execute(
-                """INSERT INTO memories (
-                    id, content, normalized_content, timestamp,
-                    emotion, importance, category, access_count, last_accessed,
-                    linked_ids, episode_id, sensory_data, camera_position,
-                    tags, links, novelty_score, prediction_error,
-                    activation_count, last_activated, reading
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    memory_id, content, normalized_content, timestamp,
-                    emotion, importance, category,
-                    meta.get("access_count", 0), meta.get("last_accessed", ""),
-                    meta.get("linked_ids", ""), episode_id or None,
-                    meta.get("sensory_data", ""),
-                    meta.get("camera_position") or None,
-                    meta.get("tags", ""), meta.get("links", ""),
-                    0.0, 0.0, 0, "", reading,
-                ),
+        await self._backend.insert_memory(
+            MemoryRecord(
+                memory=memory,
+                normalized_content=normalized_content,
+                reading=reading,
+                vector=vector_blob,
             )
-            db.execute(
-                "INSERT INTO embeddings (memory_id, vector) VALUES (?,?)",
-                (memory_id, vector_blob),
-            )
-            db.commit()
-
-        await asyncio.to_thread(_insert)
+        )
         self._bm25_index.mark_dirty()
         await self._working_memory.add(memory)
         return memory
@@ -434,55 +236,33 @@ class MemoryStore:
         date_to: str | None = None,
     ) -> list[tuple[Memory, float]]:
         """Return (memory, cosine_distance) pairs, sorted ascending by distance."""
-        db = self._ensure_connected()
         normalized_query = normalize_japanese(query)
         query_emb = await self._encode_query(normalized_query)
         query_vec = np.array(query_emb, dtype=np.float32)
 
-        # Build WHERE clause for filters
-        conditions: list[str] = []
-        params: list[Any] = []
-        if emotion_filter:
-            conditions.append("m.emotion = ?")
-            params.append(emotion_filter)
-        if category_filter:
-            conditions.append("m.category = ?")
-            params.append(category_filter)
-        if date_from:
-            conditions.append("m.timestamp >= ?")
-            params.append(date_from)
-        if date_to:
-            conditions.append("m.timestamp <= ?")
-            params.append(date_to)
-
-        where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        sql = f"SELECT m.*, e.vector FROM memories m JOIN embeddings e ON m.id = e.memory_id {where_clause}"
-
-        def _query() -> list[tuple[sqlite3.Row, bytes]]:
-            rows = db.execute(sql, params).fetchall()
-            return [(row, bytes(row["vector"])) for row in rows]
-
-        rows_with_vecs = await asyncio.to_thread(_query)
-        if not rows_with_vecs:
+        candidates = await self._backend.fetch_memories_with_vectors(
+            emotion=emotion_filter,
+            category=category_filter,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        if not candidates:
             return []
 
         # Stack vectors for batch cosine similarity
-        vecs = np.stack([decode_vector(blob) for _, blob in rows_with_vecs])
+        vecs = np.stack([decode_vector(c.vector) for c in candidates])
         scores = cosine_similarity(query_vec, vecs)  # higher = more similar
 
         # Convert similarity to distance (like ChromaDB cosine distance)
         # cosine distance = 1 - similarity
-        indexed = list(enumerate(rows_with_vecs))
+        indexed = list(enumerate(candidates))
         ranked = sorted(indexed, key=lambda t: scores[t[0]], reverse=True)
         ranked = ranked[:n_results]
 
         results: list[tuple[Memory, float]] = []
-        for idx, (row, _) in ranked:
-            memory_id = row["id"]
-            coactivation = await asyncio.to_thread(self._get_coactivation, db, memory_id)
-            memory = _row_to_memory(row, coactivation)
+        for idx, candidate in ranked:
             distance = float(1.0 - scores[idx])
-            results.append((memory, distance))
+            results.append((candidate.memory, distance))
 
         return results
 
@@ -630,140 +410,57 @@ class MemoryStore:
 
     async def list_recent(self, limit: int = 10, category_filter: str | None = None) -> list[Memory]:
         """List recent memories sorted by timestamp descending."""
-        db = self._ensure_connected()
-
-        def _fetch() -> list[sqlite3.Row]:
-            if category_filter:
-                return db.execute(
-                    "SELECT * FROM memories WHERE category = ? ORDER BY timestamp DESC LIMIT ?",
-                    (category_filter, limit),
-                ).fetchall()
-            return db.execute(
-                "SELECT * FROM memories ORDER BY timestamp DESC LIMIT ?", (limit,)
-            ).fetchall()
-
-        rows = await asyncio.to_thread(_fetch)
-        memories: list[Memory] = []
-        for row in rows:
-            coactivation = await asyncio.to_thread(self._get_coactivation, db, row["id"])
-            memories.append(_row_to_memory(row, coactivation))
-        return memories
+        return await self._backend.fetch_recent_memories(limit=limit, category=category_filter)
 
     # ── get_stats ───────────────────────────────
 
     async def get_stats(self) -> MemoryStats:
         """Get statistics about stored memories."""
-        db = self._ensure_connected()
-
-        def _fetch() -> tuple[list[sqlite3.Row], str | None, str | None]:
-            rows = db.execute("SELECT emotion, category, timestamp FROM memories").fetchall()
-            oldest = db.execute("SELECT MIN(timestamp) FROM memories").fetchone()[0]
-            newest = db.execute("SELECT MAX(timestamp) FROM memories").fetchone()[0]
-            return rows, oldest, newest
-
-        rows, oldest, newest = await asyncio.to_thread(_fetch)
+        facets = await self._backend.fetch_memory_facets()
 
         by_category: dict[str, int] = {}
         by_emotion: dict[str, int] = {}
-        for row in rows:
-            cat = row["category"] or "daily"
-            emo = row["emotion"] or "neutral"
+        for emotion, category, _timestamp in facets.rows:
+            cat = category or "daily"
+            emo = emotion or "neutral"
             by_category[cat] = by_category.get(cat, 0) + 1
             by_emotion[emo] = by_emotion.get(emo, 0) + 1
 
         return MemoryStats(
-            total_count=len(rows),
+            total_count=len(facets.rows),
             by_category=by_category,
             by_emotion=by_emotion,
-            oldest_timestamp=oldest,
-            newest_timestamp=newest,
+            oldest_timestamp=facets.oldest_timestamp,
+            newest_timestamp=facets.newest_timestamp,
         )
 
     # ── get_by_id / get_by_ids ──────────────────
 
     async def get_by_id(self, memory_id: str) -> Memory | None:
-        db = self._ensure_connected()
-
-        def _fetch() -> Memory | None:
-            return self._fetch_memory_by_id(db, memory_id)
-
-        return await asyncio.to_thread(_fetch)
+        return await self._backend.fetch_memory(memory_id)
 
     async def get_by_ids(self, memory_ids: list[str]) -> list[Memory]:
         if not memory_ids:
             return []
-        db = self._ensure_connected()
-
-        def _fetch() -> list[Memory]:
-            return self._fetch_memories_by_ids_sync(db, memory_ids)
-
-        return await asyncio.to_thread(_fetch)
+        return await self._backend.fetch_memories(memory_ids)
 
     # ── get_all ─────────────────────────────────
 
     async def get_all(self) -> list[Memory]:
         """Return all memories."""
-        db = self._ensure_connected()
+        return await self._backend.fetch_all_memories()
 
-        def _fetch() -> list[Memory]:
-            rows = db.execute("SELECT * FROM memories").fetchall()
-            memories: list[Memory] = []
-            for row in rows:
-                coactivation = self._get_coactivation(db, row["id"])
-                memories.append(_row_to_memory(row, coactivation))
-            return memories
+    # ── get_vectors ─────────────────────────────
 
-        return await asyncio.to_thread(_fetch)
+    async def get_vectors(self, memory_ids: list[str]) -> dict[str, bytes]:
+        """指定 ID の埋め込みベクトルを取る（sleep の圧縮フェーズが使う）。"""
+        return await self._backend.fetch_vectors(memory_ids)
 
     # ── delete_memory ──────────────────────────
 
     async def delete_memory(self, memory_id: str) -> bool:
-        """Delete a memory and clean up references.
-
-        Embeddings and coactivation rows are CASCADE-deleted by SQLite.
-        linked_ids and links JSON in other memories are cleaned up manually.
-        """
-        db = self._ensure_connected()
-
-        def _delete() -> bool:
-            # Check existence
-            row = db.execute("SELECT id FROM memories WHERE id = ?", (memory_id,)).fetchone()
-            if row is None:
-                return False
-
-            # Remove from other memories' linked_ids
-            referencing = db.execute(
-                "SELECT id, linked_ids FROM memories WHERE linked_ids LIKE ?",
-                (f"%{memory_id}%",),
-            ).fetchall()
-            for ref_row in referencing:
-                current = _parse_linked_ids(ref_row["linked_ids"] or "")
-                updated = tuple(lid for lid in current if lid != memory_id)
-                db.execute(
-                    "UPDATE memories SET linked_ids = ? WHERE id = ?",
-                    (",".join(updated), ref_row["id"]),
-                )
-
-            # Remove from other memories' links JSON
-            linking = db.execute(
-                "SELECT id, links FROM memories WHERE links LIKE ?",
-                (f"%{memory_id}%",),
-            ).fetchall()
-            for link_row in linking:
-                links = _parse_links(link_row["links"] or "")
-                updated_links = tuple(lk for lk in links if lk.target_id != memory_id)
-                links_json = json.dumps([lk.to_dict() for lk in updated_links])
-                db.execute(
-                    "UPDATE memories SET links = ? WHERE id = ?",
-                    (links_json, link_row["id"]),
-                )
-
-            # Delete the memory (CASCADE handles embeddings & coactivation)
-            db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-            db.commit()
-            return True
-
-        result = await asyncio.to_thread(_delete)
+        """Delete a memory and clean up references."""
+        result = await self._backend.delete_memory(memory_id)
         if result:
             self._bm25_index.mark_dirty()
         return result
@@ -834,36 +531,15 @@ class MemoryStore:
     # ── update_access ───────────────────────────
 
     async def update_access(self, memory_id: str) -> None:
-        db = self._ensure_connected()
-
-        def _update() -> None:
-            db.execute(
-                """UPDATE memories
-                   SET access_count = access_count + 1,
-                       last_accessed = ?
-                   WHERE id = ?""",
-                (datetime.now().isoformat(), memory_id),
-            )
-            db.commit()
-
-        await asyncio.to_thread(_update)
+        await self._backend.increment_access(memory_id, datetime.now().isoformat())
 
     # ── update_episode_id ───────────────────────
 
     async def update_episode_id(self, memory_id: str, episode_id: str) -> None:
-        db = self._ensure_connected()
         ep_val = episode_id if episode_id else None
-
-        def _update() -> None:
-            result = db.execute(
-                "UPDATE memories SET episode_id = ? WHERE id = ?",
-                (ep_val, memory_id),
-            )
-            if result.rowcount == 0:
-                raise ValueError(f"Memory not found: {memory_id}")
-            db.commit()
-
-        await asyncio.to_thread(_update)
+        updated = await self._backend.update_episode_id(memory_id, ep_val)
+        if not updated:
+            raise ValueError(f"Memory not found: {memory_id}")
 
     # ── update_memory_fields ────────────────────
 
@@ -871,28 +547,12 @@ class MemoryStore:
         """Update arbitrary fields on a memory row."""
         if not fields:
             return True
-        db = self._ensure_connected()
 
-        # Map field names to column names (most are 1:1)
-        valid_cols = {
-            "access_count", "last_accessed", "linked_ids", "episode_id",
-            "sensory_data", "camera_position", "tags", "links",
-            "novelty_score", "prediction_error", "activation_count",
-            "last_activated", "reading", "importance",
-        }
-        valid = {k: v for k, v in fields.items() if k in valid_cols}
+        valid = {k: v for k, v in fields.items() if k in UPDATABLE_FIELDS}
         if not valid:
             return True
 
-        set_clause = ", ".join(f"{k} = ?" for k in valid)
-        values = list(valid.values()) + [memory_id]
-
-        def _update() -> bool:
-            result = db.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
-            db.commit()
-            return result.rowcount > 0
-
-        return await asyncio.to_thread(_update)
+        return await self._backend.update_memory_fields(memory_id, valid)
 
     # ── record_activation ───────────────────────
 
@@ -921,8 +581,6 @@ class MemoryStore:
         delta: float = 0.1,
     ) -> bool:
         """Increment coactivation weights symmetrically."""
-        db = self._ensure_connected()
-
         # Check both exist
         source = await self.get_by_id(source_id)
         target = await self.get_by_id(target_id)
@@ -931,23 +589,11 @@ class MemoryStore:
 
         delta = max(0.0, min(1.0, delta))
 
-        def _bump() -> None:
-            for s_id, t_id in [(source_id, target_id), (target_id, source_id)]:
-                row = db.execute(
-                    "SELECT weight FROM coactivation WHERE source_id = ? AND target_id = ?",
-                    (s_id, t_id),
-                ).fetchone()
-                current = float(row["weight"]) if row else 0.0
-                new_weight = max(0.0, min(1.0, current + delta))
-                db.execute(
-                    """INSERT INTO coactivation (source_id, target_id, weight)
-                       VALUES (?, ?, ?)
-                       ON CONFLICT(source_id, target_id) DO UPDATE SET weight = excluded.weight""",
-                    (s_id, t_id, new_weight),
-                )
-            db.commit()
+        for s_id, t_id in [(source_id, target_id), (target_id, source_id)]:
+            current = await self._backend.fetch_coactivation_weight(s_id, t_id)
+            new_weight = max(0.0, min(1.0, (current or 0.0) + delta))
+            await self._backend.put_coactivation(s_id, t_id, new_weight)
 
-        await asyncio.to_thread(_bump)
         return True
 
     # ── maybe_add_related_link ──────────────────
@@ -958,14 +604,8 @@ class MemoryStore:
         target_id: str,
         threshold: float = 0.6,
     ) -> bool:
-        db = self._ensure_connected()
-        row = await asyncio.to_thread(
-            db.execute,
-            "SELECT weight FROM coactivation WHERE source_id = ? AND target_id = ?",
-            (source_id, target_id),
-        )
-        r = row.fetchone()
-        if r is None or float(r["weight"]) < threshold:
+        weight = await self._backend.fetch_coactivation_weight(source_id, target_id)
+        if weight is None or weight < threshold:
             return False
         await self.add_causal_link(
             source_id=source_id,
@@ -990,7 +630,6 @@ class MemoryStore:
         memories_to_link = [r.memory for r in similar_memories if r.distance <= link_threshold]
         linked_ids = tuple(m.id for m in memories_to_link)
 
-        db = self._ensure_connected()
         memory_id = str(uuid.uuid4())
         timestamp = datetime.now().isoformat()
         importance = max(1, min(5, importance))
@@ -1010,31 +649,14 @@ class MemoryStore:
         embedding = await self._encode_document(normalized_content)
         vector_blob = encode_vector(embedding)
 
-        def _insert() -> None:
-            meta = memory.to_metadata()
-            db.execute(
-                """INSERT INTO memories (
-                    id, content, normalized_content, timestamp,
-                    emotion, importance, category, access_count, last_accessed,
-                    linked_ids, episode_id, sensory_data, camera_position,
-                    tags, links, novelty_score, prediction_error,
-                    activation_count, last_activated, reading
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    memory_id, content, normalized_content, timestamp,
-                    emotion, importance, category,
-                    0, "",
-                    meta.get("linked_ids", ""), None,
-                    "", None, "", "", 0.0, 0.0, 0, "", reading,
-                ),
+        await self._backend.insert_memory(
+            MemoryRecord(
+                memory=memory,
+                normalized_content=normalized_content,
+                reading=reading,
+                vector=vector_blob,
             )
-            db.execute(
-                "INSERT INTO embeddings (memory_id, vector) VALUES (?,?)",
-                (memory_id, vector_blob),
-            )
-            db.commit()
-
-        await asyncio.to_thread(_insert)
+        )
         self._bm25_index.mark_dirty()
 
         for target_id in linked_ids:
@@ -1045,20 +667,7 @@ class MemoryStore:
     # ── _add_bidirectional_link ─────────────────
 
     async def _add_bidirectional_link(self, source_id: str, target_id: str) -> None:
-        db = self._ensure_connected()
-
-        def _link() -> None:
-            for mem_id, other_id in [(source_id, target_id), (target_id, source_id)]:
-                row = db.execute("SELECT linked_ids FROM memories WHERE id = ?", (mem_id,)).fetchone()
-                if row is None:
-                    continue
-                current = _parse_linked_ids(row["linked_ids"] or "")
-                if other_id not in current:
-                    new_linked = ",".join(current + (other_id,))
-                    db.execute("UPDATE memories SET linked_ids = ? WHERE id = ?", (new_linked, mem_id))
-            db.commit()
-
-        await asyncio.to_thread(_link)
+        await self._backend.add_bidirectional_link(source_id, target_id)
 
     # ── get_linked_memories ─────────────────────
 
@@ -1188,29 +797,12 @@ class MemoryStore:
         since: str | None = None,
         n_results: int = 10,
     ) -> list[Memory]:
-        db = self._ensure_connected()
-
-        def _fetch() -> list[Memory]:
-            conditions = [
-                "importance >= ?",
-                "access_count >= ?",
-            ]
-            params: list[Any] = [min_importance, min_access_count]
-            if since:
-                conditions.append("last_accessed >= ?")
-                params.append(since)
-            where = " AND ".join(conditions)
-            rows = db.execute(
-                f"SELECT * FROM memories WHERE {where} ORDER BY last_accessed DESC LIMIT ?",
-                params + [n_results],
-            ).fetchall()
-            memories: list[Memory] = []
-            for row in rows:
-                coactivation = self._get_coactivation(db, row["id"])
-                memories.append(_row_to_memory(row, coactivation))
-            return memories
-
-        return await asyncio.to_thread(_fetch)
+        return await self._backend.fetch_important_memories(
+            min_importance=min_importance,
+            min_access_count=min_access_count,
+            since=since,
+            limit=n_results,
+        )
 
     # ── get_working_memory ──────────────────────
 
@@ -1220,76 +812,21 @@ class MemoryStore:
     # ── Episode CRUD ────────────────────────────
 
     async def save_episode(self, episode: Episode) -> None:
-        """Persist an Episode to the episodes table."""
-        db = self._ensure_connected()
-
-        def _insert() -> None:
-            db.execute(
-                """INSERT INTO episodes
-                   (id, title, start_time, end_time, memory_ids, participants,
-                    location_context, summary, emotion, importance)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    episode.id,
-                    episode.title,
-                    episode.start_time,
-                    episode.end_time or None,
-                    ",".join(episode.memory_ids),
-                    ",".join(episode.participants),
-                    episode.location_context,
-                    episode.summary,
-                    episode.emotion,
-                    episode.importance,
-                ),
-            )
-            db.commit()
-
-        await asyncio.to_thread(_insert)
+        """Persist an Episode."""
+        await self._backend.insert_episode(episode)
 
     async def get_episode_by_id(self, episode_id: str) -> Episode | None:
-        db = self._ensure_connected()
-
-        def _fetch() -> Episode | None:
-            row = db.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone()
-            if row is None:
-                return None
-            return _row_to_episode(row)
-
-        return await asyncio.to_thread(_fetch)
+        return await self._backend.fetch_episode(episode_id)
 
     async def search_episodes(self, query: str, n_results: int = 5) -> list[Episode]:
-        """Search episodes by title/summary (LIKE search, good enough for few episodes)."""
-        db = self._ensure_connected()
-        pattern = f"%{query}%"
-
-        def _fetch() -> list[Episode]:
-            rows = db.execute(
-                """SELECT * FROM episodes
-                   WHERE title LIKE ? OR summary LIKE ?
-                   ORDER BY start_time DESC LIMIT ?""",
-                (pattern, pattern, n_results),
-            ).fetchall()
-            return [_row_to_episode(row) for row in rows]
-
-        return await asyncio.to_thread(_fetch)
+        """Search episodes by title/summary."""
+        return await self._backend.search_episodes(query, n_results)
 
     async def list_all_episodes(self) -> list[Episode]:
-        db = self._ensure_connected()
-
-        def _fetch() -> list[Episode]:
-            rows = db.execute("SELECT * FROM episodes ORDER BY start_time DESC").fetchall()
-            return [_row_to_episode(row) for row in rows]
-
-        return await asyncio.to_thread(_fetch)
+        return await self._backend.fetch_all_episodes()
 
     async def delete_episode(self, episode_id: str) -> None:
-        db = self._ensure_connected()
-
-        def _delete() -> None:
-            db.execute("DELETE FROM episodes WHERE id = ?", (episode_id,))
-            db.commit()
-
-        await asyncio.to_thread(_delete)
+        await self._backend.delete_episode(episode_id)
 
     # ── Divergent recall ─────────────────────────
 
@@ -1423,24 +960,15 @@ class MemoryStore:
     # ── Hopfield ─────────────────────────────────
 
     async def hopfield_load(self) -> int:
-        """Load all embeddings from SQLite into Hopfield network."""
-        db = self._ensure_connected()
-
-        def _fetch() -> list[tuple[str, bytes, str]]:
-            sql = (
-                "SELECT e.memory_id, e.vector, m.normalized_content"
-                " FROM embeddings e JOIN memories m ON m.id = e.memory_id"
-            )
-            return db.execute(sql).fetchall()
-
-        rows = await asyncio.to_thread(_fetch)
+        """Load all embeddings into the Hopfield network."""
+        rows = await self._backend.fetch_all_vectors()
         if not rows:
             self._hopfield.store([], [], [])
             return 0
 
-        ids = [r[0] for r in rows]
-        embeddings = [decode_vector(bytes(r[1])).tolist() for r in rows]
-        contents = [r[2] for r in rows]
+        ids = [r.memory_id for r in rows]
+        embeddings = [decode_vector(r.vector).tolist() for r in rows]
+        contents = [r.normalized_content for r in rows]
         self._hopfield.store(embeddings, ids, contents)
         return self._hopfield.n_memories
 

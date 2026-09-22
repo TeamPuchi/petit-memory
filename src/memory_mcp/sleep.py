@@ -190,28 +190,22 @@ class SleepEngine:
             by_category.setdefault(m.category, []).append(m)
 
         merged_results: list[dict] = []
-        db = self._store._ensure_connected()
 
         for category, mems in by_category.items():
             if len(mems) < 2:
                 continue
 
-            # Load embeddings
+            # Load embeddings（保管層越し。SQL はここには無い）
             mem_ids = [m.id for m in mems]
             id_to_mem = {m.id: m for m in mems}
 
-            placeholders = ",".join("?" * len(mem_ids))
-            rows = db.execute(
-                f"SELECT memory_id, vector FROM embeddings WHERE memory_id IN ({placeholders})",
-                mem_ids,
-            ).fetchall()
-
-            if len(rows) < 2:
+            blobs = await self._store.get_vectors(mem_ids)
+            if len(blobs) < 2:
                 continue
 
             id_to_vec: dict[str, np.ndarray] = {}
-            for row in rows:
-                id_to_vec[row["memory_id"]] = decode_vector(bytes(row["vector"]))
+            for memory_id, blob in blobs.items():
+                id_to_vec[memory_id] = decode_vector(blob)
 
             # Greedy grouping by cosine similarity
             available = set(id_to_vec.keys())
