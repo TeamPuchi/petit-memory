@@ -1,4 +1,8 @@
-"""SQLite + numpy の保管層（段0 で store.py から移設。中身は変えていない）。"""
+"""SQLite + numpy の保管層。
+
+段0 で store.py から移設し、段1 で値の直列化を records.py に寄せた
+（DynamoDB 実装と同じ属性名・同じ表現を使うため）。SQL 自体は変えていない。
+"""
 
 from __future__ import annotations
 
@@ -8,19 +12,23 @@ import sqlite3
 from typing import Any
 
 from .config import MemoryConfig
+from .records import (
+    EPISODE_ATTRIBUTES,
+    MEMORY_ATTRIBUTES,
+    decode_episode,
+    decode_memory,
+    encode_episode,
+    encode_memory,
+    parse_linked_ids,
+    parse_links,
+)
 from .store_backend import (
     MemoryFacets,
     MemoryRecord,
     MemoryWithVector,
     VectorRow,
 )
-from .types import (
-    CameraPosition,
-    Episode,
-    Memory,
-    MemoryLink,
-    SensoryData,
-)
+from .types import Episode, Memory
 
 # ──────────────────────────────────────────────
 # DDL
@@ -83,96 +91,18 @@ CREATE TABLE IF NOT EXISTS episodes (
 """
 
 # ──────────────────────────────────────────────
-# Row → Memory helpers
+# Row → Memory / Episode
 # ──────────────────────────────────────────────
-
-
-def _parse_linked_ids(linked_ids_str: str) -> tuple[str, ...]:
-    if not linked_ids_str:
-        return ()
-    return tuple(id.strip() for id in linked_ids_str.split(",") if id.strip())
-
-
-def _parse_sensory_data(sensory_data_json: str) -> tuple[SensoryData, ...]:
-    if not sensory_data_json:
-        return ()
-    try:
-        data_list = json.loads(sensory_data_json)
-        return tuple(SensoryData.from_dict(d) for d in data_list)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return ()
-
-
-def _parse_camera_position(camera_position_json: str | None) -> CameraPosition | None:
-    if not camera_position_json:
-        return None
-    try:
-        data = json.loads(camera_position_json)
-        return CameraPosition.from_dict(data)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return None
-
-
-def _parse_tags(tags_str: str) -> tuple[str, ...]:
-    if not tags_str:
-        return ()
-    return tuple(tag.strip() for tag in tags_str.split(",") if tag.strip())
-
-
-def _parse_links(links_json: str) -> tuple[MemoryLink, ...]:
-    if not links_json:
-        return ()
-    try:
-        data_list = json.loads(links_json)
-        return tuple(MemoryLink.from_dict(d) for d in data_list)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return ()
 
 
 def _row_to_memory(row: sqlite3.Row, coactivation: tuple[tuple[str, float], ...] = ()) -> Memory:
     """Convert a SQLite Row from the memories table to a Memory object."""
-    episode_id_raw = row["episode_id"]
-    episode_id = episode_id_raw if episode_id_raw else None
-
-    return Memory(
-        id=row["id"],
-        content=row["content"],
-        timestamp=row["timestamp"],
-        emotion=row["emotion"],
-        importance=row["importance"],
-        category=row["category"],
-        access_count=row["access_count"],
-        last_accessed=row["last_accessed"] or "",
-        linked_ids=_parse_linked_ids(row["linked_ids"] or ""),
-        episode_id=episode_id,
-        sensory_data=_parse_sensory_data(row["sensory_data"] or ""),
-        camera_position=_parse_camera_position(row["camera_position"]),
-        tags=_parse_tags(row["tags"] or ""),
-        links=_parse_links(row["links"] or ""),
-        novelty_score=float(row["novelty_score"] or 0.0),
-        prediction_error=float(row["prediction_error"] or 0.0),
-        activation_count=int(row["activation_count"] or 0),
-        last_activated=row["last_activated"] or "",
-        coactivation_weights=coactivation,
-    )
+    return decode_memory(dict(row), coactivation)
 
 
 def _row_to_episode(row: sqlite3.Row) -> Episode:
     """Convert a SQLite Row from the episodes table to an Episode object."""
-    memory_ids_raw = row["memory_ids"] or ""
-    participants_raw = row["participants"] or ""
-    return Episode(
-        id=row["id"],
-        title=row["title"],
-        start_time=row["start_time"],
-        end_time=row["end_time"] or None,
-        memory_ids=tuple(memory_ids_raw.split(",") if memory_ids_raw else []),
-        participants=tuple(participants_raw.split(",") if participants_raw else []),
-        location_context=row["location_context"] or None,
-        summary=row["summary"] or "",
-        emotion=row["emotion"],
-        importance=int(row["importance"]),
-    )
+    return decode_episode(dict(row))
 
 
 # ──────────────────────────────────────────────
@@ -408,33 +338,16 @@ class SqliteMemoryStore:
 
     async def insert_memory(self, record: MemoryRecord) -> None:
         db = self._ensure_connected()
-        memory = record.memory
+        attrs = encode_memory(record)
+        columns = ", ".join(MEMORY_ATTRIBUTES)
+        placeholders = ",".join("?" * len(MEMORY_ATTRIBUTES))
+        values = [attrs[name] for name in MEMORY_ATTRIBUTES]
 
         def _insert() -> None:
-            meta = memory.to_metadata()
-            db.execute(
-                """INSERT INTO memories (
-                    id, content, normalized_content, timestamp,
-                    emotion, importance, category, access_count, last_accessed,
-                    linked_ids, episode_id, sensory_data, camera_position,
-                    tags, links, novelty_score, prediction_error,
-                    activation_count, last_activated, reading
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    memory.id, memory.content, record.normalized_content, memory.timestamp,
-                    memory.emotion, memory.importance, memory.category,
-                    meta.get("access_count", 0), meta.get("last_accessed", ""),
-                    meta.get("linked_ids", ""), memory.episode_id or None,
-                    meta.get("sensory_data", ""),
-                    meta.get("camera_position") or None,
-                    meta.get("tags", ""), meta.get("links", ""),
-                    memory.novelty_score, memory.prediction_error,
-                    memory.activation_count, memory.last_activated, record.reading,
-                ),
-            )
+            db.execute(f"INSERT INTO memories ({columns}) VALUES ({placeholders})", values)
             db.execute(
                 "INSERT INTO embeddings (memory_id, vector) VALUES (?,?)",
-                (memory.id, record.vector),
+                (record.memory.id, record.vector),
             )
             db.commit()
 
@@ -505,7 +418,7 @@ class SqliteMemoryStore:
                 (f"%{memory_id}%",),
             ).fetchall()
             for ref_row in referencing:
-                current = _parse_linked_ids(ref_row["linked_ids"] or "")
+                current = parse_linked_ids(ref_row["linked_ids"] or "")
                 updated = tuple(lid for lid in current if lid != memory_id)
                 db.execute(
                     "UPDATE memories SET linked_ids = ? WHERE id = ?",
@@ -518,7 +431,7 @@ class SqliteMemoryStore:
                 (f"%{memory_id}%",),
             ).fetchall()
             for link_row in linking:
-                links = _parse_links(link_row["links"] or "")
+                links = parse_links(link_row["links"] or "")
                 updated_links = tuple(lk for lk in links if lk.target_id != memory_id)
                 links_json = json.dumps([lk.to_dict() for lk in updated_links])
                 db.execute(
@@ -541,7 +454,7 @@ class SqliteMemoryStore:
                 row = db.execute("SELECT linked_ids FROM memories WHERE id = ?", (mem_id,)).fetchone()
                 if row is None:
                     continue
-                current = _parse_linked_ids(row["linked_ids"] or "")
+                current = parse_linked_ids(row["linked_ids"] or "")
                 if other_id not in current:
                     new_linked = ",".join(current + (other_id,))
                     db.execute("UPDATE memories SET linked_ids = ? WHERE id = ?", (new_linked, mem_id))
@@ -622,26 +535,13 @@ class SqliteMemoryStore:
 
     async def insert_episode(self, episode: Episode) -> None:
         db = self._ensure_connected()
+        attrs = encode_episode(episode)
+        columns = ", ".join(EPISODE_ATTRIBUTES)
+        placeholders = ",".join("?" * len(EPISODE_ATTRIBUTES))
+        values = [attrs[name] for name in EPISODE_ATTRIBUTES]
 
         def _insert() -> None:
-            db.execute(
-                """INSERT INTO episodes
-                   (id, title, start_time, end_time, memory_ids, participants,
-                    location_context, summary, emotion, importance)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    episode.id,
-                    episode.title,
-                    episode.start_time,
-                    episode.end_time or None,
-                    ",".join(episode.memory_ids),
-                    ",".join(episode.participants),
-                    episode.location_context,
-                    episode.summary,
-                    episode.emotion,
-                    episode.importance,
-                ),
-            )
+            db.execute(f"INSERT INTO episodes ({columns}) VALUES ({placeholders})", values)
             db.commit()
 
         await asyncio.to_thread(_insert)
