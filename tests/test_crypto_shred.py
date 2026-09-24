@@ -360,3 +360,54 @@ async def test_plaintext_rows_still_read_when_encryption_is_on(aws, config: Memo
     assert {m.id for m in await plain.fetch_all_memories()} == {"old"}
     await plain.disconnect()
     await enc.disconnect()
+
+
+async def test_episode_title_and_summary_are_sealed_and_stay_gone_after_restore(
+    store: DynamoMemoryStore, config: MemoryConfig, aws
+) -> None:
+    """K21: `EPI#` の題・要約も暗号化し、忘れた後に本体の表を戻しても読めない。"""
+    from memory_mcp.types import Episode
+
+    def episode(episode_id: str, title: str, start: str) -> Episode:
+        return Episode(
+            id=episode_id,
+            title=title,
+            start_time=start,
+            end_time=None,
+            memory_ids=("mem-1",),
+            participants=("なぎ",),
+            location_context="青海島の見える窓辺",
+            summary=f"{title}の要約",
+            emotion="happy",
+            importance=4,
+        )
+
+    await store.insert_episode(episode("epi-keep", "残すエピソード", "2026-09-25T09:00:00"))
+    await store.insert_episode(episode("epi-gone", SECRET, "2026-09-25T10:00:00"))
+
+    rows = [i for i in scan_all(aws["house"]) if i["sk"].startswith("EPI#")]
+    dump = raw_bytes(rows)
+    for secret in (SECRET, "残すエピソード", "青海島", "なぎ"):
+        assert secret.encode("utf-8") not in dump
+    assert all(int(r["enc_v"]) == 1 and r["emotion"] == "happy" for r in rows)  # メタは平文
+    assert (await store.fetch_episode("epi-gone")).title == SECRET
+
+    backup = scan_all(aws["house"])
+    await store.delete_episode("epi-gone")
+    assert "Item" not in aws["keys"].get_item(Key={"pk": "P#mio", "sk": "KEY#epi-gone"})
+
+    with aws["house"].batch_writer() as writer:
+        for item in backup:
+            writer.put_item(Item=item)
+    assert any("epi-gone" in i["sk"] for i in scan_all(aws["house"]))  # 暗号文は物理的に戻っている
+
+    fresh = DynamoMemoryStore(config)
+    await fresh.connect()
+    try:
+        for backend in (store, fresh):
+            assert await backend.fetch_episode("epi-gone") is None
+            assert [e.id for e in await backend.fetch_all_episodes()] == ["epi-keep"]
+            assert await backend.search_episodes(SECRET[:4], 10) == []
+            assert [e.title for e in await backend.search_episodes("残す", 10)] == ["残すエピソード"]
+    finally:
+        await fresh.disconnect()

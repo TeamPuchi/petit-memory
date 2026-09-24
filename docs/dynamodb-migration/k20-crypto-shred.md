@@ -22,11 +22,13 @@ house 表（PITR 35日）                     鍵の表 petit-<env>-memory-keys�
 |---|---|---|
 | `MEM#` / `PRIV#` | `content`・`normalized_content`・`reading`・`sensory_data`（説明文・縮小画像）・`links`（note に本文が混ざりうる） | `id`・`timestamp`・`emotion`・`importance`・`category`・`tags`・`indexed`・`private`・`access_count` など・`linked_ids`（id だけ）・`camera_position`・`episode_id` |
 | `VEC#` | ベクトル（本文をある程度復元できる） | `memory_id` |
-| `FORGET#` / `IDX#` / `COACT#` / `EPI#` | — | そのまま |
+| `EPI#`（K21 で追加） | `title`・`summary`・`participants`・`location_context` | `id`・`start_time`・`end_time`・`memory_ids`・`emotion`・`importance` |
+| `FORGET#` / `IDX#` / `COACT#` | — | そのまま |
 
 - 暗号化した行には平文で `enc_v = 1` が付く（射影だけの読みで「鍵が要る行か」を判定するため）。
 - AAD は `"<pid>|<memory id>|mem"` / `"…|vec"`。暗号文を別の記憶・別のぷちに貼り替えても開かない。
-- `EPI#`（エピソードの題・要約）は今回の対象外（本文ではなく記憶から作る見出し。要確定に上げた）。
+- `EPI#` は K21（2026-09-24）で対象に入れた（本文から中身が分かるものは全部対象、の原則）。AAD は `"<pid>|<episode id>|epi"`、
+  鍵は `KEY#<episode id>`（episode id は UUID なので記憶と衝突しない）。`delete_episode` は鍵を先に消す。
 
 ## 読み・検索
 
