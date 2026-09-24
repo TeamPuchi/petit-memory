@@ -36,6 +36,21 @@ pk が `id` になる GSI はその壁の外に出てしまう。
 `indexed` 属性が 0 の記憶は、意味検索の母集団（`fetch_memories_with_vectors`）と
 Hopfield の母集団（`fetch_all_vectors`）、無作為の 1 件の母集団
 （`fetch_indexed_memory_ids`）から外す。ID 指定の読みと新着一覧では従来どおり出る。
+
+## 暗号シュレッダー（K20）
+
+`MemoryConfig.keys_table` と `kms_key_id` を両方与えると、記憶 1 件ごとの DEK で
+本文（`SECRET_MEMORY_ATTRIBUTES`）とベクトルを AES-256-GCM で暗号化して置く。
+DEK は KMS で包んで別の「鍵の表」に置き、忘れるときは鍵から消す（`crypto_shred.py`）。
+
+- `MEM#` / `PRIV#` — 本文類は `sealed`（Binary）1 本にまとめ、`enc_v` = 1 を平文で付ける。
+  id・日時・感情・種類・重要度・タグ・index/private フラグ・リンク先 id は平文のまま
+  （絞り込み・保守・消した跡のため）。
+- `VEC#` — `vector` の代わりに `vector_sealed`。
+- `FORGET#` — 従来どおり平文（本文は元から持たない）。
+
+鍵の無い暗号文（忘れた項目を PITR / S3 から戻したもの）は、どの読みでも「無いもの」として扱う。
+復号はこのプロセスの中だけ・その場だけで、平文 DEK はメモリにだけ持つ。
 """
 
 from __future__ import annotations
@@ -46,6 +61,7 @@ from decimal import Decimal
 from typing import Any
 
 from .config import MemoryConfig
+from .crypto_shred import CryptoShredder, KmsDataKeyWrapper, open_json, open_sealed, seal, seal_json
 from .records import (
     decode_episode,
     decode_forget_marker,
@@ -79,6 +95,18 @@ _SK_MAX = "￿"
 _BATCH_GET_LIMIT = 100
 _TRANSACT_LIMIT = 100
 
+# K20: 暗号化する記憶の属性（本文をある程度復元できるもの）。残りは平文のメタデータ。
+SECRET_MEMORY_ATTRIBUTES: tuple[str, ...] = (
+    "content",
+    "normalized_content",
+    "reading",
+    "sensory_data",
+    "links",  # リンクの note に本文が混ざりうる
+)
+SEALED_ATTRIBUTE = "sealed"
+SEALED_VERSION_ATTRIBUTE = "enc_v"
+SEALED_VECTOR_ATTRIBUTE = "vector_sealed"
+
 
 def _to_attribute(value: Any) -> Any:
     """DynamoDB が受け取れる形にする（float は Decimal、None は空文字）。"""
@@ -108,6 +136,15 @@ def _sk_suffix(sk: str) -> str:
     return sk.split("#", 1)[1]
 
 
+def _as_bytes(value: Any) -> bytes:
+    """boto3 の `Binary` か bytes を bytes にする。"""
+    return bytes(value.value) if hasattr(value, "value") else bytes(value)
+
+
+def _is_sealed(item: dict[str, Any]) -> bool:
+    return SEALED_VERSION_ATTRIBUTE in item
+
+
 def _is_indexed(item: dict[str, Any]) -> bool:
     """`index:false` で保存された記憶か。段2 より前の行には属性が無いので既定は True。"""
     value = item.get("indexed")
@@ -130,6 +167,9 @@ class DynamoMemoryStore:
         self._petit_id = config.petit_id
         self._table: Any = None
         self._client: Any = None
+        self._shredder: CryptoShredder | None = None
+        if bool(config.keys_table) != bool(config.kms_key_id):
+            raise ValueError("keys_table と kms_key_id は両方そろえて設定する（K20 暗号シュレッダー）")
 
     # ── キー組み立て ────────────────────────────
 
@@ -204,14 +244,30 @@ class DynamoMemoryStore:
             # 素のクライアント。resource 側のクライアントは Item/Key を自動で
             # 変換するため、自分で型を組み立てる操作（transact / batch_get）には使えない。
             client = boto3.client("dynamodb")
-            return table, client
+            shredder = None
+            if self._config.keys_table:
+                shredder = CryptoShredder(
+                    self._petit_id,
+                    self._config.keys_table,
+                    KmsDataKeyWrapper(self._config.kms_key_id, boto3.client("kms")),
+                    dynamodb_client=client,
+                )
+            return table, client, shredder
 
-        self._table, self._client = await asyncio.to_thread(_open)
+        self._table, self._client, self._shredder = await asyncio.to_thread(_open)
 
     async def disconnect(self) -> None:
         """リソースを手放す（DynamoDB に閉じる接続は無い）。"""
         self._table = None
         self._client = None
+        if self._shredder is not None:
+            self._shredder.clear_cache()
+        self._shredder = None
+
+    @property
+    def encrypted(self) -> bool:
+        """暗号シュレッダーが効いているか。"""
+        return self._shredder is not None
 
     def _ensure_connected(self) -> Any:
         if self._table is None:
@@ -356,6 +412,111 @@ class DynamoMemoryStore:
             return None
         return pointer.get("target_sk")
 
+    # ── 暗号シュレッダー（K20）───────────────────
+
+    def _seal_memory_attrs(self, memory_id: str, attrs: dict[str, Any], dek: bytes) -> dict[str, Any]:
+        """本文類を `sealed` 1 本にまとめて暗号化し、平文の属性から外す。"""
+        assert self._shredder is not None
+        secret = {name: attrs.get(name) for name in SECRET_MEMORY_ATTRIBUTES}
+        sealed = {k: v for k, v in attrs.items() if k not in SECRET_MEMORY_ATTRIBUTES}
+        sealed[SEALED_ATTRIBUTE] = seal_json(dek, secret, self._shredder.aad(memory_id, "mem"))
+        sealed[SEALED_VERSION_ATTRIBUTE] = 1
+        return sealed
+
+    def _open_memory_items_sync(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """暗号化された記憶を復号して平文の属性に戻す。鍵の無いもの（忘れた項目）は落とす。
+
+        暗号化していない行（段2 までの行・暗号シュレッダー無効の環境）はそのまま通す。
+        """
+        sealed_ids = [str(item["id"]) for item in items if _is_sealed(item)]
+        if not sealed_ids:
+            return items
+        keys = self._shredder.keys_for(sealed_ids) if self._shredder is not None else {}
+        opened: list[dict[str, Any]] = []
+        for item in items:
+            if not _is_sealed(item):
+                opened.append(item)
+                continue
+            dek = keys.get(str(item["id"]))
+            if dek is None or SEALED_ATTRIBUTE not in item:
+                continue
+            assert self._shredder is not None
+            secret = open_json(dek, _as_bytes(item[SEALED_ATTRIBUTE]), self._shredder.aad(str(item["id"]), "mem"))
+            plain = {k: v for k, v in item.items() if k not in (SEALED_ATTRIBUTE, SEALED_VERSION_ATTRIBUTE)}
+            plain.update(secret)
+            opened.append(plain)
+        return opened
+
+    def _readable_sync(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """鍵のある（読める）記憶だけ残す。復号はしない（射影した読みの絞り込み用）。"""
+        sealed_ids = [str(item["id"]) for item in items if _is_sealed(item)]
+        if not sealed_ids:
+            return items
+        keys = self._shredder.keys_for(sealed_ids) if self._shredder is not None else {}
+        return [item for item in items if not _is_sealed(item) or str(item["id"]) in keys]
+
+    def _vector_item_sync(self, memory_id: str, vector: bytes, dek: bytes | None) -> dict[str, Any]:
+        base = {**self._key(self.vector_sk(memory_id)), "entity": "vector", "memory_id": memory_id}
+        if dek is None:
+            return {**base, "vector": vector}
+        assert self._shredder is not None
+        return {
+            **base,
+            SEALED_VECTOR_ATTRIBUTE: seal(dek, vector, self._shredder.aad(memory_id, "vec")),
+            SEALED_VERSION_ATTRIBUTE: 1,
+        }
+
+    def _open_vectors_sync(self, items: list[dict[str, Any]]) -> dict[str, bytes]:
+        """`VEC#` の行から memory_id → ベクトルの bytes。鍵の無いものは落とす。"""
+        sealed_ids = [str(item["memory_id"]) for item in items if SEALED_VECTOR_ATTRIBUTE in item]
+        keys = self._shredder.keys_for(sealed_ids) if (sealed_ids and self._shredder is not None) else {}
+        result: dict[str, bytes] = {}
+        for item in items:
+            memory_id = str(item["memory_id"])
+            if SEALED_VECTOR_ATTRIBUTE not in item:
+                if "vector" in item:
+                    result[memory_id] = _as_bytes(item["vector"])
+                continue
+            dek = keys.get(memory_id)
+            if dek is None:
+                continue
+            assert self._shredder is not None
+            result[memory_id] = open_sealed(
+                dek, _as_bytes(item[SEALED_VECTOR_ATTRIBUTE]), self._shredder.aad(memory_id, "vec")
+            )
+        return result
+
+    def _write_secret_fields_sync(self, item: dict[str, Any], updates: dict[str, Any]) -> None:
+        """記憶 1 件の属性を書き換える。暗号化された行の本文類は復号→差し替え→再暗号化する。"""
+        table = self._ensure_connected()
+        plain_updates = {k: v for k, v in updates.items() if k not in SECRET_MEMORY_ATTRIBUTES}
+        secret_updates = {k: v for k, v in updates.items() if k in SECRET_MEMORY_ATTRIBUTES}
+
+        if secret_updates and _is_sealed(item):
+            opened = self._open_memory_items_sync([item])
+            if not opened:
+                # 鍵が無い＝忘れた記憶。書き換える中身も無い
+                return
+            assert self._shredder is not None
+            memory_id = str(item["id"])
+            dek = self._shredder.require_key(memory_id)
+            secret = {name: opened[0].get(name) for name in SECRET_MEMORY_ATTRIBUTES}
+            secret.update(secret_updates)
+            plain_updates[SEALED_ATTRIBUTE] = seal_json(dek, secret, self._shredder.aad(memory_id, "mem"))
+        else:
+            plain_updates.update(secret_updates)
+
+        if not plain_updates:
+            return
+        names = {f"#f{i}": name for i, name in enumerate(plain_updates)}
+        values = {f":v{i}": _to_attribute(value) for i, value in enumerate(plain_updates.values())}
+        table.update_item(
+            Key=self._key(str(item["sk"])),
+            UpdateExpression="SET " + ", ".join(f"{n} = {v}" for n, v in zip(names, values)),
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+
     # ── 共活性の読み ────────────────────────────
 
     def _coactivation_map_sync(self) -> dict[str, tuple[tuple[str, float], ...]]:
@@ -383,7 +544,10 @@ class DynamoMemoryStore:
             item = self._get_item_sync(sk)
             if item is None:
                 return None
-            return decode_memory(_plain(item), self._coactivation_for_sync(memory_id))
+            opened = self._open_memory_items_sync([item])
+            if not opened:
+                return None
+            return decode_memory(_plain(opened[0]), self._coactivation_for_sync(memory_id))
 
         return await asyncio.to_thread(_fetch)
 
@@ -396,7 +560,7 @@ class DynamoMemoryStore:
             target_sks = [p["target_sk"] for p in pointers if p.get("target_sk")]
             if not target_sks:
                 return []
-            items = self._batch_get_sync(target_sks)
+            items = self._open_memory_items_sync(self._batch_get_sync(target_sks))
             coactivation = self._coactivation_map_sync()
             return [
                 decode_memory(_plain(item), coactivation.get(item["id"], ()))
@@ -407,7 +571,7 @@ class DynamoMemoryStore:
 
     async def fetch_all_memories(self) -> list[Memory]:
         def _fetch() -> list[Memory]:
-            items = self._query_memories_sync()
+            items = self._open_memory_items_sync(self._query_memories_sync())
             coactivation = self._coactivation_map_sync()
             return [
                 decode_memory(_plain(item), coactivation.get(item["id"], ()))
@@ -442,10 +606,13 @@ class DynamoMemoryStore:
             if not selected:
                 return []
 
-            vectors = {
-                item["memory_id"]: bytes(item["vector"].value)
-                for item in self._batch_get_sync([self.vector_sk(i["id"]) for i in selected])
-            }
+            # 復号はここで（鍵の無い＝忘れた記憶は落ちる）
+            selected = self._open_memory_items_sync(selected)
+            if not selected:
+                return []
+            vectors = self._open_vectors_sync(
+                self._batch_get_sync([self.vector_sk(i["id"]) for i in selected])
+            )
             coactivation = self._coactivation_map_sync()
 
             results: list[MemoryWithVector] = []
@@ -471,7 +638,8 @@ class DynamoMemoryStore:
             items = self._query_memories_sync(forward=False)
             if category:
                 items = [item for item in items if item.get("category") == category]
-            items = items[: max(0, limit)]
+            items = self._readable_sync(items)[: max(0, limit)]
+            items = self._open_memory_items_sync(items)
             coactivation = self._coactivation_map_sync()
             return [
                 decode_memory(_plain(item), coactivation.get(item["id"], ()))
@@ -497,7 +665,7 @@ class DynamoMemoryStore:
                 and (since is None or str(item.get("last_accessed", "")) >= since)
             ]
             selected.sort(key=lambda item: str(item.get("last_accessed", "")), reverse=True)
-            selected = selected[: max(0, limit)]
+            selected = self._open_memory_items_sync(self._readable_sync(selected)[: max(0, limit)])
             coactivation = self._coactivation_map_sync()
             return [
                 decode_memory(_plain(item), coactivation.get(item["id"], ()))
@@ -508,8 +676,10 @@ class DynamoMemoryStore:
 
     async def fetch_memory_facets(self) -> MemoryFacets:
         def _fetch() -> MemoryFacets:
-            items = self._query_memories_sync(
-                projection=["emotion", "category", "timestamp"]
+            items = self._readable_sync(
+                self._query_memories_sync(
+                    projection=["id", "emotion", "category", "timestamp", SEALED_VERSION_ATTRIBUTE]
+                )
             )
             rows = tuple(
                 (
@@ -540,17 +710,16 @@ class DynamoMemoryStore:
         memory_sk = self.memory_sk(memory.timestamp, memory.id, memory.private)
 
         def _write() -> None:
+            dek: bytes | None = None
+            body = attrs
+            if self._shredder is not None:
+                # 鍵を先に置く（本体だけ残って鍵が無い、は「読めない」側なので安全）
+                dek = self._shredder.new_key(memory.id)
+                body = self._seal_memory_attrs(memory.id, attrs, dek)
             self._transact_write_sync(
                 [
-                    {"Put": {**self._key(memory_sk), "entity": "memory", **attrs}},
-                    {
-                        "Put": {
-                            **self._key(self.vector_sk(memory.id)),
-                            "entity": "vector",
-                            "memory_id": memory.id,
-                            "vector": record.vector,
-                        }
-                    },
+                    {"Put": {**self._key(memory_sk), "entity": "memory", **body}},
+                    {"Put": self._vector_item_sync(memory.id, record.vector, dek)},
                     {
                         "Put": {
                             **self._key(self.pointer_sk(memory.id)),
@@ -572,20 +741,14 @@ class DynamoMemoryStore:
             sk = self._resolve_memory_sk_sync(memory_id)
             if sk is None:
                 return False
-            table = self._ensure_connected()
-            names = {f"#f{i}": name for i, name in enumerate(fields)}
-            values = {
-                f":v{i}": _to_attribute(value) for i, value in enumerate(fields.values())
-            }
-            expression = "SET " + ", ".join(
-                f"{name_key} = {value_key}" for name_key, value_key in zip(names, values)
-            )
-            table.update_item(
-                Key=self._key(sk),
-                UpdateExpression=expression,
-                ExpressionAttributeNames=names,
-                ExpressionAttributeValues=values,
-            )
+            if any(name in SECRET_MEMORY_ATTRIBUTES for name in fields):
+                # 本文類を含む書き換えは、暗号化された行なら復号→差し替え→再暗号化
+                item = self._get_item_sync(sk)
+                if item is None:
+                    return False
+            else:
+                item = {"id": memory_id, "sk": sk}
+            self._write_secret_fields_sync(item, dict(fields))
             return True
 
         return await asyncio.to_thread(_update)
@@ -620,10 +783,13 @@ class DynamoMemoryStore:
             if sk is None:
                 return False
 
-            table = self._ensure_connected()
+            # K20: 先に鍵を消す。ここから先で落ちても、残った暗号文は誰にも読めない
+            if self._shredder is not None:
+                self._shredder.shred(memory_id)
 
-            # 他の記憶の linked_ids / links から消す
-            for item in self._query_memories_sync():
+            # 他の記憶の linked_ids / links から消す（links は暗号化されているので開いて見る）
+            raw_items = {str(raw["id"]): raw for raw in self._query_memories_sync()}
+            for item in self._open_memory_items_sync(list(raw_items.values())):
                 if item["id"] == memory_id:
                     continue
                 updates: dict[str, Any] = {}
@@ -636,15 +802,8 @@ class DynamoMemoryStore:
                     updates["links"] = json.dumps([link.to_dict() for link in remaining])
                 if not updates:
                     continue
-                names = {f"#f{i}": name for i, name in enumerate(updates)}
-                values = {f":v{i}": value for i, value in enumerate(updates.values())}
-                table.update_item(
-                    Key=self._key(item["sk"]),
-                    UpdateExpression="SET "
-                    + ", ".join(f"{n} = {v}" for n, v in zip(names, values)),
-                    ExpressionAttributeNames=names,
-                    ExpressionAttributeValues=values,
-                )
+                # 封をしたままの行を渡す（暗号化された行なら links を再暗号化して書く）
+                self._write_secret_fields_sync(raw_items[str(item["id"])], updates)
 
             # 本体・ベクトル・指し札・共活性
             deletes: list[dict[str, Any]] = [
@@ -722,7 +881,9 @@ class DynamoMemoryStore:
         """無作為の 1 件を選ぶための母集団。ID だけを射影して読む。"""
 
         def _fetch() -> list[str]:
-            items = self._query_memories_sync(projection=["id", "indexed"])
+            items = self._readable_sync(
+                self._query_memories_sync(projection=["id", "indexed", SEALED_VERSION_ATTRIBUTE])
+            )
             return [item["id"] for item in items if _is_indexed(item)]
 
         return await asyncio.to_thread(_fetch)
@@ -748,9 +909,10 @@ class DynamoMemoryStore:
                         forward=not before,
                         sk_from=None if before else bound,
                         sk_to=bound if before else None,
-                        limit=2,
+                        # 錨 1 件＋忘れた記憶を戻したもの（鍵が無い）を読み飛ばす余裕
+                        limit=None if self._shredder is not None else 2,
                     )
-                    for item in items:
+                    for item in self._readable_sync(items):
                         candidate = _sk_suffix(str(item["sk"]))
                         if candidate == suffix:
                             continue
@@ -770,7 +932,10 @@ class DynamoMemoryStore:
             def _decode(item: dict[str, Any] | None) -> Memory | None:
                 if item is None:
                     return None
-                return decode_memory(_plain(item), coactivation.get(item["id"], ()))
+                opened = self._open_memory_items_sync([item])
+                if not opened:
+                    return None
+                return decode_memory(_plain(opened[0]), coactivation.get(item["id"], ()))
 
             return (_decode(previous_item), _decode(next_item))
 
@@ -784,30 +949,32 @@ class DynamoMemoryStore:
 
         def _fetch() -> dict[str, bytes]:
             items = self._batch_get_sync([self.vector_sk(mid) for mid in memory_ids])
-            return {item["memory_id"]: bytes(item["vector"].value) for item in items}
+            return self._open_vectors_sync(items)
 
         return await asyncio.to_thread(_fetch)
 
     async def fetch_all_vectors(self) -> list[VectorRow]:
         def _fetch() -> list[VectorRow]:
-            vectors = self._query_prefix_sync(VECTOR_PREFIX)
+            vector_items = self._query_prefix_sync(VECTOR_PREFIX)
             # 段2: index:false は Hopfield の母集団にも載せない
-            contents = {
-                item["id"]: item.get("normalized_content", "")
+            memory_items = [
+                item
                 for item in self._query_memories_sync(
-                    projection=["id", "normalized_content", "indexed"]
+                    projection=["id", "normalized_content", "indexed", SEALED_ATTRIBUTE, SEALED_VERSION_ATTRIBUTE]
                 )
                 if _is_indexed(item)
+            ]
+            contents = {
+                item["id"]: item.get("normalized_content", "")
+                for item in self._open_memory_items_sync(memory_items)
             }
+            vectors = self._open_vectors_sync([i for i in vector_items if i["memory_id"] in contents])
             rows: list[VectorRow] = []
-            for item in vectors:
-                memory_id = item["memory_id"]
-                if memory_id not in contents:
-                    continue
+            for memory_id, vector in vectors.items():
                 rows.append(
                     VectorRow(
                         memory_id=memory_id,
-                        vector=bytes(item["vector"].value),
+                        vector=vector,
                         normalized_content=contents[memory_id],
                     )
                 )

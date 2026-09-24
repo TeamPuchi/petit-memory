@@ -26,6 +26,10 @@ class MemoryConfig:
     # DynamoMemoryStore.partition_key 1 か所だけ。
     house_id: str = ""
     petit_id: str = ""
+    # K20: 暗号シュレッダー。鍵の表と KMS の鍵を両方与えたときだけ、DynamoDB 実装が
+    # 本文・ベクトルを 1 件ごとの DEK で暗号化する（SQLite のローカル版には効かない）。
+    keys_table: str = ""
+    kms_key_id: str = ""
 
     @classmethod
     def from_env(cls) -> "MemoryConfig":
@@ -41,6 +45,8 @@ class MemoryConfig:
             dynamo_table=os.getenv("PETIT_MEMORY_DYNAMO_TABLE", "house"),
             house_id=os.getenv("PETIT_MEMORY_HOUSE_ID", ""),
             petit_id=os.getenv("PETIT_MEMORY_PETIT_ID", ""),
+            keys_table=os.getenv("PETIT_MEMORY_KEYS_TABLE", ""),
+            kms_key_id=os.getenv("PETIT_MEMORY_KMS_KEY_ID", ""),
         )
 
 

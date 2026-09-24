@@ -22,6 +22,8 @@ dependencies = [
 # DynamoDB 保管層（PETIT_MEMORY_STORE=dynamo / dual のときだけ必要）
 dynamo = [
     "boto3>=1.34.0",
+    # K20: 暗号シュレッダー（AES-256-GCM）
+    "cryptography>=42.0.0",
 ]
 dev = [
     "pytest>=8.0.0",
@@ -29,6 +31,7 @@ dev = [
     "ruff>=0.3.0",
     "boto3>=1.34.0",
     "moto[dynamodb]>=5.0.0",
+    "cryptography>=42.0.0",
 ]
 
 [project.scripts]

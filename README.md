@@ -53,6 +53,8 @@ uv run memory-mcp
 | `PETIT_MEMORY_DYNAMO_TABLE` | `house` | DynamoDB 単一表の表名(`dynamo` / `dual` のときだけ使う) |
 | `PETIT_MEMORY_HOUSE_ID` | (空) | 家ID。**空なら `pk = P#<pid>`、値があれば従来形の `pk = H#<hid>#P#<pid>`**(`dynamo` / `dual` のときだけ使う) |
 | `PETIT_MEMORY_PETIT_ID` | (空) | pk の個体ID(`dynamo` / `dual` のときだけ使う) |
+| `PETIT_MEMORY_KEYS_TABLE` | (空) | K20 暗号シュレッダーの「鍵の表」(例 `petit-v0-memory-keys`)。`PETIT_MEMORY_KMS_KEY_ID` と**両方**そろえると DynamoDB 実装が本文・ベクトルを1件ごとの鍵で暗号化する。SQLite(ローカル版)には効かない。[docs](docs/dynamodb-migration/k20-crypto-shred.md) |
+| `PETIT_MEMORY_KMS_KEY_ID` | (空) | DEK を包む KMS の鍵(例 `alias/petit-v0-memory`) |
 
 ## Claude Code連携
 

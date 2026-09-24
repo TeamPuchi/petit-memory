@@ -119,13 +119,15 @@ async def sqlite_backend(memory_config: MemoryConfig):
     await backend.disconnect()
 
 
-@pytest.fixture(params=["sqlite", "dynamo"])
+@pytest.fixture(params=["sqlite", "dynamo", "dynamo_encrypted"])
 async def any_backend(request, house_table, memory_config: MemoryConfig, dynamo_config: MemoryConfig):
-    """同じテストを SQLite と DynamoDB の両方で回すためのフィクスチャ。"""
+    """同じテストを SQLite・DynamoDB・DynamoDB＋暗号シュレッダー（K20）で回すためのフィクスチャ。"""
     if request.param == "sqlite":
         backend = SqliteMemoryStore(memory_config)
-    else:
+    elif request.param == "dynamo":
         backend = DynamoMemoryStore(dynamo_config)
+    else:
+        backend = DynamoMemoryStore(_encrypted_config(dynamo_config))
     await backend.connect()
     yield backend
     await backend.disconnect()
@@ -140,6 +142,27 @@ async def dual_backend(house_table, memory_config: MemoryConfig, dynamo_config: 
     await backend.connect()
     yield backend
     await backend.disconnect()
+
+
+def _encrypted_config(base: MemoryConfig) -> MemoryConfig:
+    """鍵の表と KMS の鍵を moto 上に作り、暗号シュレッダーを効かせた設定を返す。"""
+    from dataclasses import replace
+
+    keys_table = "petit-test-memory-keys"
+    boto3.resource("dynamodb", region_name=REGION).create_table(
+        TableName=keys_table,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    key_id = boto3.client("kms", region_name=REGION).create_key()["KeyMetadata"]["KeyId"]
+    return replace(base, keys_table=keys_table, kms_key_id=key_id)
 
 
 def sk_list(table, partition_key: str, prefix: str) -> list[str]:
