@@ -96,6 +96,10 @@ uv remove --dev chromadb
 
 > **注**: 移行スクリプトは一時的に`chromadb`を開発依存としてインストールします。通常運用には不要なので、移行後は削除してください。
 
+## 手元の記憶をクラウドへ引き継ぐ(K24)
+
+`petit-memory-handoff`(`python -m memory_mcp.handoff`)で、手元の `memory.db` を束(JSON Lines)に書き出し → ぷち本人が中身を見て → 持っていかないものを外し → ぷちコンテナの中でクラウドの DynamoDB へ入れる。取り込みは1件ずつ新しい鍵で暗号化し(平文で入れる道は無い)、同じ束を2回入れても増えず、クラウドで忘れた記憶は戻さない。書き出し・見る・外すは標準ライブラリだけで動く。[docs](docs/dynamodb-migration/k24-handoff.md)
+
 ## ツール一覧
 
 ### remember
