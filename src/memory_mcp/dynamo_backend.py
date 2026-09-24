@@ -948,6 +948,42 @@ class DynamoMemoryStore:
 
         return await asyncio.to_thread(_fetch)
 
+    # ── 引継ぎ（K24）─────────────────────────
+
+    async def fetch_handoff_state(self) -> tuple[set[str], set[str], set[str]]:
+        """引継ぎの取り込みが「もう入っているか」を見るための id の集合。
+
+        戻り値は (記憶の id, エピソードの id, 忘れた跡のある記憶の id)。指し札と `FORGET#` だけを読む。
+        """
+
+        def _fetch() -> tuple[set[str], set[str], set[str]]:
+            memory_ids: set[str] = set()
+            episode_ids: set[str] = set()
+            for item in self._query_prefix_sync(POINTER_PREFIX, projection=["sk", "memory_id", "episode_id"]):
+                sk = str(item["sk"])
+                if sk.startswith(EPISODE_POINTER_PREFIX):
+                    episode_ids.add(sk[len(EPISODE_POINTER_PREFIX) :])
+                else:
+                    memory_ids.add(sk[len(POINTER_PREFIX) :])
+            forgotten = {
+                str(item["memory_id"])
+                for item in self._query_prefix_sync(FORGET_PREFIX, projection=["memory_id"])
+            }
+            return memory_ids, episode_ids, forgotten
+
+        return await asyncio.to_thread(_fetch)
+
+    async def put_forget_marker(self, marker: ForgetMarker) -> None:
+        """忘れた跡だけを書く（本文は元から無い）。sk が決まっているので同じ跡を何度書いても 1 件。"""
+        attrs = {key: _to_attribute(value) for key, value in encode_forget_marker(marker).items()}
+
+        def _put() -> None:
+            self._ensure_connected().put_item(
+                Item={**self._key(self.forget_sk(marker.forgotten_at, marker.memory_id)), "entity": "forget", **attrs}
+            )
+
+        await asyncio.to_thread(_put)
+
     # ── 一覧の材料（段2）──────────────────────
 
     async def fetch_indexed_memory_ids(self) -> list[str]:

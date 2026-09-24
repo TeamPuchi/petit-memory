@@ -36,6 +36,8 @@ dev = [
 
 [project.scripts]
 memory-mcp = "memory_mcp.server:main"
+# K24: 手元の記憶をクラウドへ引き継ぐ道具（export / show / drop / import）
+petit-memory-handoff = "memory_mcp.handoff:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memory_mcp"]
