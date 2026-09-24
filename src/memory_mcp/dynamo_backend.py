@@ -486,6 +486,37 @@ class DynamoMemoryStore:
             opened.append(plain)
         return opened
 
+    def _scrub_episodes_referencing_sync(self, memory_id: str) -> None:
+        """`memory_id` を含む EPI# の鍵を shred し、題・要約を消して stale にする（K22）。
+
+        `SECRET_EPISODE_ATTRIBUTES`（題・要約・関与者・場所）は1つの `sealed` にまとまっているので、
+        鍵を shred すると4つとも読めなくなる（このエピソード自体を捨てるわけではないので、参照する
+        記憶を忘れるたびに毎回このうち一部だけ更新するより、鍵ごと作り直す方が単純で安全）。
+        `id`・`start_time`・`end_time`・`memory_ids`・`emotion`・`importance`（エピソードの枠）と
+        `memory_ids` は平文のまま触らない。暗号化していない house（shredder 無し）でも同じ形で消す。
+        """
+        table = self._ensure_connected()
+        for item in self._query_prefix_sync(EPISODE_PREFIX):
+            ids = (item.get("memory_ids") or "").split(",")
+            if memory_id not in ids:
+                continue
+            episode_id = str(item["id"])
+            if self._shredder is not None:
+                self._shredder.shred(episode_id)
+            updates: dict[str, Any] = dict.fromkeys(SECRET_EPISODE_ATTRIBUTES, "")
+            updates["stale"] = True
+            names = {f"#f{i}": name for i, name in enumerate(updates)}
+            values = {f":v{i}": _to_attribute(value) for i, value in enumerate(updates.values())}
+            table.update_item(
+                Key=self._key(str(item["sk"])),
+                UpdateExpression=(
+                    "SET " + ", ".join(f"{n} = {v}" for n, v in zip(names, values))
+                    + " REMOVE #sealed, #encv"
+                ),
+                ExpressionAttributeNames={**names, "#sealed": SEALED_ATTRIBUTE, "#encv": SEALED_VERSION_ATTRIBUTE},
+                ExpressionAttributeValues=values,
+            )
+
     def _readable_sync(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """鍵のある（読める）記憶だけ残す。復号はしない（射影した読みの絞り込み用）。"""
         sealed_ids = [str(item["id"]) for item in items if _is_sealed(item)]
@@ -825,6 +856,9 @@ class DynamoMemoryStore:
             # K20: 先に鍵を消す。ここから先で落ちても、残った暗号文は誰にも読めない
             if self._shredder is not None:
                 self._shredder.shred(memory_id)
+
+            # K22: この記憶を含む EPI# の題・要約も消す（要約に忘れた記憶の中身が残る問題への v0 対処）
+            self._scrub_episodes_referencing_sync(memory_id)
 
             # 他の記憶の linked_ids / links から消す（links は暗号化されているので開いて見る）
             raw_items = {str(raw["id"]): raw for raw in self._query_memories_sync()}

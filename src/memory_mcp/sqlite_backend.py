@@ -110,6 +110,11 @@ _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("private", "INTEGER NOT NULL DEFAULT 0"),
 )
 
+# K22 より前の memory.db には無い列（episodes 表）。
+_ADDED_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("stale", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:
     """ぷちてゃたちの既存 memory.db をそのまま読めるようにする。"""
@@ -117,6 +122,10 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in _ADDED_COLUMNS:
         if name not in existing:
             conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
+    existing_episode = {row["name"] for row in conn.execute("PRAGMA table_info(episodes)")}
+    for name, ddl in _ADDED_EPISODE_COLUMNS:
+        if name not in existing_episode:
+            conn.execute(f"ALTER TABLE episodes ADD COLUMN {name} {ddl}")
 
 
 # ──────────────────────────────────────────────
@@ -472,6 +481,19 @@ class SqliteMemoryStore:
                 db.execute(
                     "UPDATE memories SET links = ? WHERE id = ?",
                     (links_json, link_row["id"]),
+                )
+
+            # K22: この記憶を含む EPI# の題・要約も消す（要約に忘れた記憶の中身が残る問題への v0 対処）。
+            # 枠（id・start_time・end_time・memory_ids・emotion・importance）は触らない。
+            for epi_row in db.execute(
+                "SELECT id, memory_ids FROM episodes WHERE memory_ids LIKE ?", (f"%{memory_id}%",)
+            ).fetchall():
+                if memory_id not in (epi_row["memory_ids"] or "").split(","):
+                    continue
+                db.execute(
+                    "UPDATE episodes SET title = '', summary = '', participants = '', "
+                    "location_context = '', stale = 1 WHERE id = ?",
+                    (epi_row["id"],),
                 )
 
             # Delete the memory (CASCADE handles embeddings & coactivation)

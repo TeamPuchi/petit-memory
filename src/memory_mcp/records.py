@@ -65,6 +65,7 @@ EPISODE_ATTRIBUTES: tuple[str, ...] = (
     "summary",
     "emotion",
     "importance",
+    "stale",
 )
 
 
@@ -206,6 +207,7 @@ def encode_episode(episode: Episode) -> dict[str, Any]:
         "summary": episode.summary,
         "emotion": episode.emotion,
         "importance": episode.importance,
+        "stale": episode.stale,
     }
 
 
@@ -223,6 +225,8 @@ def decode_episode(attrs: Mapping[str, Any]) -> Episode:
         summary=attrs["summary"] or "",
         emotion=attrs["emotion"],
         importance=int(attrs["importance"]),
+        # K22 より前の行には無い属性なので既定は False
+        stale=bool(attrs["stale"]) if attrs.get("stale") is not None else False,
     )
 
 
