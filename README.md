@@ -56,6 +56,8 @@ uv run memory-mcp
 | `PETIT_MEMORY_KEYS_TABLE` | (空) | K20 暗号シュレッダーの「鍵の表」(例 `petit-v0-memory-keys`)。`PETIT_MEMORY_KMS_KEY_ID` と**両方**そろえると DynamoDB 実装が本文・ベクトルを1件ごとの鍵で暗号化する。SQLite(ローカル版)には効かない。[docs](docs/dynamodb-migration/k20-crypto-shred.md) |
 | `PETIT_MEMORY_KMS_KEY_ID` | (空) | DEK を包む KMS の鍵(例 `alias/petit-v0-memory`) |
 
+> 暗号シュレッダーの限界(K21・2026-09-24): AWS アカウントの管理者は KMS の鍵ポリシーを書き換える(`PutKeyPolicy`)ことで、自分に Decrypt を足すことが技術的にはできる。その操作は CloudTrail に必ず残るので、「運営が黙って記憶を読む」ことはできないが、「読めない」ではない。忘れた記憶(鍵を消したもの)は、管理者でも読めない。
+
 ## Claude Code連携
 
 `.mcp.json`(または`~/.claude/settings.json`)に追加します。
