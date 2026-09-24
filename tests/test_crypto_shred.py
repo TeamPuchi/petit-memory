@@ -411,3 +411,43 @@ async def test_episode_title_and_summary_are_sealed_and_stay_gone_after_restore(
             assert [e.title for e in await backend.search_episodes("残す", 10)] == ["残すエピソード"]
     finally:
         await fresh.disconnect()
+
+
+async def test_forgetting_a_memory_clears_its_episodes_title_and_summary(store: DynamoMemoryStore, aws) -> None:
+    """K22: memory_ids に含む記憶を忘れたら EPI# の題・要約も消える（枠と memory_ids は残る）。
+
+    要約は記憶の中身から作るので、記憶だけ忘れても要約に中身が残ってしまう問題への v0 の対処。
+    """
+    from memory_mcp.types import Episode
+
+    await store.insert_memory(record(memory("mem-1", content=SECRET, timestamp="2026-09-25T09:30:00")))
+    await store.insert_memory(record(memory("mem-2", content="無事な記憶", timestamp="2026-09-25T09:40:00")))
+    await store.insert_episode(
+        Episode(
+            id="epi-1", title=f"{SECRET}の日", start_time="2026-09-25T09:00:00", end_time="2026-09-25T11:00:00",
+            memory_ids=("mem-1", "mem-2"), participants=("なぎ",), location_context="青海島の見える窓辺",
+            summary=f"{SECRET}をした一日", emotion="happy", importance=4,
+        )
+    )
+
+    assert await store.delete_memory("mem-1")
+
+    # 鍵は消えている（もう復号できない）
+    assert "Item" not in aws["keys"].get_item(Key={"pk": "P#mio", "sk": "KEY#epi-1"})
+
+    epi = await store.fetch_episode("epi-1")
+    assert epi is not None and epi.title == "" and epi.summary == "" and epi.stale is True
+    # 枠（id・時刻・memory_ids・感情・重要度）は残る。mem-2 を忘れたわけではないので消さない
+    assert epi.memory_ids == ("mem-1", "mem-2")
+    assert epi.start_time == "2026-09-25T09:00:00" and epi.end_time == "2026-09-25T11:00:00"
+    assert epi.emotion == "happy" and epi.importance == 4
+
+    rows = [i for i in scan_all(aws["house"]) if i["sk"] == "EPI#2026-09-25T09:00:00#epi-1"]
+    assert len(rows) == 1 and "sealed" not in rows[0] and "enc_v" not in rows[0]
+    assert SECRET.encode("utf-8") not in raw_bytes(rows)  # 平文で残った題・要約に中身が漏れていない
+
+    # 別の記憶を忘れても、もう関わりの無いこのエピソードは触らない
+    await store.insert_memory(record(memory("mem-3", content="他人の記憶", timestamp="2026-09-25T09:50:00")))
+    await store.delete_memory("mem-3")
+    epi_again = await store.fetch_episode("epi-1")
+    assert epi_again.stale is True and epi_again.memory_ids == ("mem-1", "mem-2")

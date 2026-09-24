@@ -306,6 +306,43 @@ async def test_backend_episode_crud(memory_config: MemoryConfig) -> None:
         await backend.disconnect()
 
 
+async def test_backend_forgetting_a_memory_clears_its_episode_summary(memory_config: MemoryConfig) -> None:
+    """K22: memory_ids に含む記憶を忘れたら EPI# の題・要約も空にして stale にする（枠は残す）。"""
+    backend = create_backend(memory_config)
+    await backend.connect()
+    try:
+        mem1 = Memory(id="mem-1", content="金魚に餌をやった", timestamp="2026-09-01T09:50:00",
+                      emotion="happy", importance=3, category="daily")
+        mem2 = Memory(id="mem-2", content="水を換えた", timestamp="2026-09-01T10:10:00",
+                      emotion="happy", importance=3, category="daily")
+        await backend.insert_memory(_record(mem1))
+        await backend.insert_memory(_record(mem2))
+        episode = Episode(
+            id="ep-1", title="金魚の世話", start_time="2026-09-01T09:00:00", end_time="2026-09-01T11:00:00",
+            memory_ids=("mem-1", "mem-2"), participants=("なぎ",), location_context=None,
+            summary="餌をやって水を換えた", emotion="happy", importance=3,
+        )
+        await backend.insert_episode(episode)
+
+        assert await backend.delete_memory("mem-1") is True
+
+        epi = await backend.fetch_episode("ep-1")
+        assert epi is not None
+        assert epi.title == "" and epi.summary == "" and epi.stale is True
+        assert epi.memory_ids == ("mem-1", "mem-2")  # memory_ids 自体は書き換えない
+        assert epi.start_time == "2026-09-01T09:00:00" and epi.emotion == "happy" and epi.importance == 3
+
+        # mem-1 と無関係の記憶を忘れても ep-1 には触らない
+        mem3 = Memory(id="mem-3", content="無関係の記憶", timestamp="2026-09-01T12:00:00",
+                      emotion="neutral", importance=2, category="daily")
+        await backend.insert_memory(_record(mem3))
+        await backend.delete_memory("mem-3")
+        still = await backend.fetch_episode("ep-1")
+        assert still.stale is True and still.title == ""
+    finally:
+        await backend.disconnect()
+
+
 # ──────────────────────────────────────────────
 # MemoryStore（計算層）が抽象越しに同じ結果を返す
 # ──────────────────────────────────────────────

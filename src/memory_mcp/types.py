@@ -152,6 +152,7 @@ class Episode:
     summary: str  # エピソード全体のサマリー
     emotion: str  # エピソード全体の感情
     importance: int  # 1-5
+    stale: bool = False  # K22: memory_ids のどれかを忘れた（題・要約は空にした）
 
     def to_metadata(self) -> dict[str, Any]:
         """Convert to dictionary for ChromaDB metadata."""
@@ -164,6 +165,7 @@ class Episode:
             "location_context": self.location_context or "",
             "emotion": self.emotion,
             "importance": self.importance,
+            "stale": self.stale,
         }
 
     @classmethod
@@ -188,6 +190,7 @@ class Episode:
             summary=summary,
             emotion=metadata["emotion"],
             importance=metadata["importance"],
+            stale=bool(metadata.get("stale", False)),
         )
 
 
