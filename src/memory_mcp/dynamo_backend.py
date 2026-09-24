@@ -47,6 +47,8 @@ DEK は KMS で包んで別の「鍵の表」に置き、忘れるときは鍵�
   id・日時・感情・種類・重要度・タグ・index/private フラグ・リンク先 id は平文のまま
   （絞り込み・保守・消した跡のため）。
 - `VEC#` — `vector` の代わりに `vector_sealed`。
+- `EPI#` — 題・要約・関与者・場所（`SECRET_EPISODE_ATTRIBUTES`）を `sealed` にまとめる（K21）。
+  id・開始/終了時刻・記憶 id 群・感情・重要度は平文。AAD の種類は `epi`、鍵は `KEY#<episode id>`。
 - `FORGET#` — 従来どおり平文（本文は元から持たない）。
 
 鍵の無い暗号文（忘れた項目を PITR / S3 から戻したもの）は、どの読みでも「無いもの」として扱う。
@@ -102,6 +104,13 @@ SECRET_MEMORY_ATTRIBUTES: tuple[str, ...] = (
     "reading",
     "sensory_data",
     "links",  # リンクの note に本文が混ざりうる
+)
+# K21: 暗号化するエピソードの属性（題・要約は記憶の本文から作るので中身が分かる）。
+SECRET_EPISODE_ATTRIBUTES: tuple[str, ...] = (
+    "title",
+    "summary",
+    "participants",
+    "location_context",
 )
 SEALED_ATTRIBUTE = "sealed"
 SEALED_VERSION_ATTRIBUTE = "enc_v"
@@ -442,6 +451,36 @@ class DynamoMemoryStore:
                 continue
             assert self._shredder is not None
             secret = open_json(dek, _as_bytes(item[SEALED_ATTRIBUTE]), self._shredder.aad(str(item["id"]), "mem"))
+            plain = {k: v for k, v in item.items() if k not in (SEALED_ATTRIBUTE, SEALED_VERSION_ATTRIBUTE)}
+            plain.update(secret)
+            opened.append(plain)
+        return opened
+
+    def _seal_episode_attrs(self, episode_id: str, attrs: dict[str, Any], dek: bytes) -> dict[str, Any]:
+        """エピソードの題・要約などを `sealed` 1 本にまとめて暗号化する（K21）。"""
+        assert self._shredder is not None
+        secret = {name: attrs.get(name) for name in SECRET_EPISODE_ATTRIBUTES}
+        sealed = {k: v for k, v in attrs.items() if k not in SECRET_EPISODE_ATTRIBUTES}
+        sealed[SEALED_ATTRIBUTE] = seal_json(dek, secret, self._shredder.aad(episode_id, "epi"))
+        sealed[SEALED_VERSION_ATTRIBUTE] = 1
+        return sealed
+
+    def _open_episode_items_sync(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """暗号化されたエピソードを復号する。鍵の無いもの（忘れたエピソード）は落とす。"""
+        sealed_ids = [str(item["id"]) for item in items if _is_sealed(item)]
+        if not sealed_ids:
+            return items
+        keys = self._shredder.keys_for(sealed_ids) if self._shredder is not None else {}
+        opened: list[dict[str, Any]] = []
+        for item in items:
+            if not _is_sealed(item):
+                opened.append(item)
+                continue
+            dek = keys.get(str(item["id"]))
+            if dek is None or SEALED_ATTRIBUTE not in item:
+                continue
+            assert self._shredder is not None
+            secret = open_json(dek, _as_bytes(item[SEALED_ATTRIBUTE]), self._shredder.aad(str(item["id"]), "epi"))
             plain = {k: v for k, v in item.items() if k not in (SEALED_ATTRIBUTE, SEALED_VERSION_ATTRIBUTE)}
             plain.update(secret)
             opened.append(plain)
@@ -1019,9 +1058,13 @@ class DynamoMemoryStore:
         episode_sk = self.episode_sk(episode.start_time, episode.id)
 
         def _write() -> None:
+            body = attrs
+            if self._shredder is not None:
+                # K21: 鍵を先に置く（本体だけが書けて鍵が無い、は「読めない」側に倒れる）
+                body = self._seal_episode_attrs(episode.id, attrs, self._shredder.new_key(episode.id))
             self._transact_write_sync(
                 [
-                    {"Put": {**self._key(episode_sk), "entity": "episode", **attrs}},
+                    {"Put": {**self._key(episode_sk), "entity": "episode", **body}},
                     {
                         "Put": {
                             **self._key(self.episode_pointer_sk(episode.id)),
@@ -1043,7 +1086,8 @@ class DynamoMemoryStore:
             item = self._get_item_sync(sk)
             if item is None:
                 return None
-            return decode_episode(_plain(item))
+            opened = self._open_episode_items_sync([item])
+            return decode_episode(_plain(opened[0])) if opened else None
 
         return await asyncio.to_thread(_fetch)
 
@@ -1051,7 +1095,7 @@ class DynamoMemoryStore:
         """タイトル・要約の部分一致。`sk` 降順＝開始時刻の新しい順。"""
 
         def _fetch() -> list[Episode]:
-            items = self._query_prefix_sync(EPISODE_PREFIX, forward=False)
+            items = self._open_episode_items_sync(self._query_prefix_sync(EPISODE_PREFIX, forward=False))
             matched = [
                 item
                 for item in items
@@ -1063,7 +1107,7 @@ class DynamoMemoryStore:
 
     async def fetch_all_episodes(self) -> list[Episode]:
         def _fetch() -> list[Episode]:
-            items = self._query_prefix_sync(EPISODE_PREFIX, forward=False)
+            items = self._open_episode_items_sync(self._query_prefix_sync(EPISODE_PREFIX, forward=False))
             return [decode_episode(_plain(item)) for item in items]
 
         return await asyncio.to_thread(_fetch)
@@ -1073,6 +1117,9 @@ class DynamoMemoryStore:
             sk = self._resolve_episode_sk_sync(episode_id)
             if sk is None:
                 return
+            # K21: 先に鍵を消す（記憶の忘れると同じ順番）
+            if self._shredder is not None:
+                self._shredder.shred(episode_id)
             self._transact_write_sync(
                 [
                     {"Delete": self._key(sk)},
