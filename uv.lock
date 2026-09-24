@@ -857,6 +857,7 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "boto3" },
+    { name = "cryptography" },
     { name = "moto", extra = ["dynamodb"] },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -864,6 +865,7 @@ dev = [
 ]
 dynamo = [
     { name = "boto3" },
+    { name = "cryptography" },
 ]
 
 [package.dev-dependencies]
@@ -875,6 +877,8 @@ dev = [
 requires-dist = [
     { name = "boto3", marker = "extra == 'dev'", specifier = ">=1.34.0" },
     { name = "boto3", marker = "extra == 'dynamo'", specifier = ">=1.34.0" },
+    { name = "cryptography", marker = "extra == 'dev'", specifier = ">=42.0.0" },
+    { name = "cryptography", marker = "extra == 'dynamo'", specifier = ">=42.0.0" },
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "moto", extras = ["dynamodb"], marker = "extra == 'dev'", specifier = ">=5.0.0" },
     { name = "pillow", specifier = ">=10.0.0" },
