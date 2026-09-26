@@ -15,6 +15,7 @@
   - `COACT#<source_id>#<target_id>`  共活性の重み（片方向 1 件。対称化は呼び出し側）
   - `IDX#<memory_id>`                記憶の指し札。属性 `target_sk` に `MEM#…` か `PRIV#…`
   - `IDX#EPI#<episode_id>`           エピソードの指し札。属性 `target_sk` に `EPI#<start_time>#<id>`
+  - `ACCESS#<ts>#<id>`               本人だけの面を運営が読んだ記録（K28。いまは書く口が無い）
 
 `sk` に時刻が入る本体を ID だけで引くために、同じパーティションに「指し札」を置く。
 GSI を使わないのは、家の壁を IAM の `dynamodb:LeadingKeys`（pk が `H#<hid>…`）で作るため。
@@ -44,7 +45,8 @@ Hopfield の母集団（`fetch_all_vectors`）、無作為の 1 件の母集団
 DEK は KMS で包んで別の「鍵の表」に置き、忘れるときは鍵から消す（`crypto_shred.py`）。
 
 - `MEM#` / `PRIV#` — 本文類は `sealed`（Binary）1 本にまとめ、`enc_v` = 1 を平文で付ける。
-  id・日時・感情・種類・重要度・タグ・index/private フラグ・リンク先 id は平文のまま
+  id・日時・感情・種類・重要度・index/private フラグ・リンク先 id は平文のまま
+  （タグは K28 で本文類に移した。自由な語が入るため）
   （絞り込み・保守・消した跡のため）。
 - `VEC#` — `vector` の代わりに `vector_sealed`。
 - `EPI#` — 題・要約・関与者・場所（`SECRET_EPISODE_ATTRIBUTES`）を `sealed` にまとめる（K21）。
@@ -65,9 +67,11 @@ from typing import Any
 from .config import MemoryConfig
 from .crypto_shred import CryptoShredder, KmsDataKeyWrapper, open_json, open_sealed, seal, seal_json
 from .records import (
+    decode_access_record,
     decode_episode,
     decode_forget_marker,
     decode_memory,
+    encode_access_record,
     encode_episode,
     encode_forget_marker,
     encode_memory,
@@ -80,7 +84,7 @@ from .store_backend import (
     MemoryWithVector,
     VectorRow,
 )
-from .types import Episode, ForgetMarker, Memory
+from .types import AccessRecord, Episode, ForgetMarker, Memory
 
 MEMORY_PREFIX = "MEM#"
 PRIVATE_PREFIX = "PRIV#"
@@ -90,6 +94,7 @@ EPISODE_PREFIX = "EPI#"
 COACTIVATION_PREFIX = "COACT#"
 POINTER_PREFIX = "IDX#"
 EPISODE_POINTER_PREFIX = "IDX#EPI#"
+ACCESS_PREFIX = "ACCESS#"
 
 # sk の範囲指定に使う終端（`#` の次の文字）
 _SK_MAX = "￿"
@@ -104,6 +109,7 @@ SECRET_MEMORY_ATTRIBUTES: tuple[str, ...] = (
     "reading",
     "sensory_data",
     "links",  # リンクの note に本文が混ざりうる
+    "tags",  # K28: 自由形式の語（本文の言葉がそのまま入りうる）
 )
 # K21: 暗号化するエピソードの属性（題・要約は記憶の本文から作るので中身が分かる）。
 SECRET_EPISODE_ATTRIBUTES: tuple[str, ...] = (
@@ -208,6 +214,11 @@ class DynamoMemoryStore:
     def forget_sk(forgotten_at: str, memory_id: str) -> str:
         """`FORGET#<ts>#<id>`。"""
         return f"{FORGET_PREFIX}{forgotten_at}#{memory_id}"
+
+    @staticmethod
+    def access_sk(read_at: str, record_id: str) -> str:
+        """`ACCESS#<ts>#<id>`。本人だけの面を運営が読んだ記録（K28）。"""
+        return f"{ACCESS_PREFIX}{read_at}#{record_id}"
 
     @staticmethod
     def vector_sk(memory_id: str) -> str:
@@ -573,16 +584,24 @@ class DynamoMemoryStore:
             secret = {name: opened[0].get(name) for name in SECRET_MEMORY_ATTRIBUTES}
             secret.update(secret_updates)
             plain_updates[SEALED_ATTRIBUTE] = seal_json(dek, secret, self._shredder.aad(memory_id, "mem"))
+            # 封をする前の行に平文で残っていた本文類（K28 で tags を足す前の行など）は外す
+            stale_plain = [name for name in SECRET_MEMORY_ATTRIBUTES if name in item]
         else:
             plain_updates.update(secret_updates)
+            stale_plain = []
 
         if not plain_updates:
             return
         names = {f"#f{i}": name for i, name in enumerate(plain_updates)}
         values = {f":v{i}": _to_attribute(value) for i, value in enumerate(plain_updates.values())}
+        expression = "SET " + ", ".join(f"{n} = {v}" for n, v in zip(names, values))
+        if stale_plain:
+            removed = {f"#r{i}": name for i, name in enumerate(stale_plain)}
+            names.update(removed)
+            expression += " REMOVE " + ", ".join(removed)
         table.update_item(
             Key=self._key(str(item["sk"])),
-            UpdateExpression="SET " + ", ".join(f"{n} = {v}" for n, v in zip(names, values)),
+            UpdateExpression=expression,
             ExpressionAttributeNames=names,
             ExpressionAttributeValues=values,
         )
@@ -945,6 +964,52 @@ class DynamoMemoryStore:
                 limit=max(0, limit) or None,
             )
             return [decode_forget_marker(_plain(item)) for item in items[: max(0, limit)]]
+
+        return await asyncio.to_thread(_fetch)
+
+    async def shred_conversation_copies(self, conversation_ids: tuple[str, ...]) -> int:
+        """自分の側の会話の写しの鍵を消す（K28）。
+
+        鍵の表は pid ごと（`P#<pid>`）なので、ここで消せるのはこのぷちの側の写しだけ。
+        記憶・エピソードの id と同じものは消さない（指し札があるものは会話ではない）。
+        """
+        if self._shredder is None or not conversation_ids:
+            return 0
+
+        def _shred() -> int:
+            count = 0
+            for conversation_id in dict.fromkeys(conversation_ids):
+                if not conversation_id:
+                    continue
+                if self._get_item_sync(self.pointer_sk(conversation_id)) is not None:
+                    continue
+                if self._get_item_sync(self.episode_pointer_sk(conversation_id)) is not None:
+                    continue
+                assert self._shredder is not None
+                if not self._shredder.has_key(conversation_id):
+                    continue  # もう鍵が無い（先に消えている）
+                self._shredder.shred(conversation_id)
+                count += 1
+            return count
+
+        return await asyncio.to_thread(_shred)
+
+    # ── 読まれた記録（K28）──────────────────
+
+    async def put_access_record(self, record: AccessRecord) -> None:
+        attrs = {key: _to_attribute(value) for key, value in encode_access_record(record).items()}
+
+        def _put() -> None:
+            self._ensure_connected().put_item(
+                Item={**self._key(self.access_sk(record.read_at, record.id)), "entity": "access", **attrs}
+            )
+
+        await asyncio.to_thread(_put)
+
+    async def fetch_access_records(self, limit: int) -> list[AccessRecord]:
+        def _fetch() -> list[AccessRecord]:
+            items = self._query_prefix_sync(ACCESS_PREFIX, forward=False, limit=max(0, limit) or None)
+            return [decode_access_record(_plain(item)) for item in items[: max(0, limit)]]
 
         return await asyncio.to_thread(_fetch)
 

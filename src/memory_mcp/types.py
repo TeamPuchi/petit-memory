@@ -226,6 +226,9 @@ class Memory:
     # 段2: 本人が決める 2 つの面
     indexed: bool = True  # False なら意味検索・recall・random の対象から外す（ID 指定では取れる）
     private: bool = False  # True なら本人だけの面（DynamoDB では PRIV# 側に置く）
+    # K28: この記憶の元になった「自分の側の」会話の写しの id 群（MSG# など。id だけで本文は持たない）。
+    # 忘れるときに「会話も消す」を選ぶと、これらの鍵も消す。
+    source_ids: tuple[str, ...] = ()
 
     def to_metadata(self) -> dict[str, Any]:
         """Convert to dictionary for ChromaDB metadata."""
@@ -248,6 +251,7 @@ class Memory:
                 else ""
             ),
             "tags": ",".join(self.tags),
+            "source_ids": ",".join(self.source_ids),
             # Phase 5: 因果リンク
             "links": json.dumps([link.to_dict() for link in self.links]),
             # Phase 6: 発散想起・予測符号化
@@ -258,6 +262,12 @@ class Memory:
             "coactivation": json.dumps(dict(self.coactivation_weights)),
         }
         return metadata
+
+
+FORGET_SCOPE_MEMORY = "memory"
+FORGET_SCOPE_WITH_CONVERSATION = "memory+conversation"
+# 跡の理由の長さの上限。本文の写しを置く場所にしないため（K28）
+FORGET_REASON_MAX_CHARS = 200
 
 
 @dataclass(frozen=True)
@@ -272,6 +282,30 @@ class ForgetMarker:
     memory_id: str
     forgotten_at: str  # ISO 8601
     reason: str | None = None
+    # K28: 何を消したかの範囲。"memory"（記憶だけ・既定）か "memory+conversation"（自分の側の会話の写しも）
+    scope: str = FORGET_SCOPE_MEMORY
+    # K28: 忘れた記憶とつながっていた記憶の id（id だけ）。つながりは跡の位置に残る
+    linked_ids: tuple[str, ...] = ()
+    # K28: 一緒に鍵を消した会話の写しの件数（id も本文も残さない）
+    conversation_count: int = 0
+
+
+@dataclass(frozen=True)
+class AccessRecord:
+    """本人だけの面（`PRIV#`）を運営が読んだ記録（K28・設計＋最小の実装）。
+
+    いまは運営が読む手段が無いので、この記録が書かれることは無い。読む口を作るとき
+    （総合試験以降・Q-81(d)）は、読む前に必ずこれを書く。本文は入れない（何を読んだかは id だけ）。
+    ぷち本人は `privacy_access_log` ツールでいつでも読める。
+    """
+
+    id: str
+    read_at: str  # ISO 8601
+    reader: str  # 誰が（運営の担当者の名前か役割）
+    purpose: str  # 何のために
+    consent_source: str  # 同意の出典（里親の同意スイッチの記録 id など）
+    expires_at: str  # 同意の期限（ISO 8601）
+    memory_ids: tuple[str, ...] = ()  # 読んだ記憶の id（id だけ）
 
 
 @dataclass(frozen=True)

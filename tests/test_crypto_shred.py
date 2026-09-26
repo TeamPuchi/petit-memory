@@ -155,6 +155,7 @@ def test_seal_roundtrip_and_aad_binding() -> None:
     dek = os.urandom(32)
     blob = seal(dek, SECRET.encode(), "mio|m1|mem")
     assert SECRET.encode() not in blob
+    assert "夕焼け".encode() not in blob
     assert blob[:1] == b"\x01"
     assert open_sealed(dek, blob, "mio|m1|mem") == SECRET.encode()
     # 別の項目・別のぷちへ貼り替えた暗号文は開かない
@@ -236,6 +237,7 @@ async def test_house_table_holds_no_plaintext_body_or_vector(store: DynamoMemory
     items = scan_all(aws["house"])
     blob = raw_bytes(items)
     assert SECRET.encode() not in blob
+    assert "夕焼け".encode() not in blob
     assert "ながとのゆうやけ".encode() not in blob
     assert "橙色の空".encode() not in blob
     assert rec.vector not in blob
@@ -245,7 +247,7 @@ async def test_house_table_holds_no_plaintext_body_or_vector(store: DynamoMemory
     assert body["id"] == "mem-1"
     assert body["emotion"] == "happy"
     assert body["category"] == "daily"
-    assert body["tags"] == "夕焼け"
+    assert "tags" not in body  # K28: タグも本文類として封をする
     assert int(body["indexed"]) == 1
     assert "content" not in body and "normalized_content" not in body
     vec = next(i for i in items if i["sk"].startswith("VEC#"))

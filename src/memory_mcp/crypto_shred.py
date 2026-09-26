@@ -259,6 +259,13 @@ class CryptoShredder:
         self._cache.put(item_id, dek)
         return dek
 
+    def has_key(self, item_id: str) -> bool:
+        """鍵の表に鍵があるか（包まれた鍵を解かずに見る。K28）。"""
+        response = self._client.get_item(
+            TableName=self._table_name, Key=self._key(item_id), ConsistentRead=True, ProjectionExpression="sk"
+        )
+        return "Item" in response
+
     def require_key(self, item_id: str) -> bytes:
         dek = self.key_for(item_id)
         if dek is None:

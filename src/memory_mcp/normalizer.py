@@ -170,5 +170,5 @@ def get_reading(text: str) -> str | None:
         morphs = tokenizer.tokenize(text)
         return "".join(m.reading_form() for m in morphs)
     except Exception as e:
-        logger.debug("sudachi tokenize failed for %r: %s", text, e)
+        logger.debug("sudachi tokenize failed (%d chars): %s", len(text), e)
         return None
