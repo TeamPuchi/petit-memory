@@ -13,12 +13,15 @@ from typing import Any
 
 from .config import MemoryConfig
 from .records import (
+    ACCESS_ATTRIBUTES,
     EPISODE_ATTRIBUTES,
     FORGET_ATTRIBUTES,
     MEMORY_ATTRIBUTES,
+    decode_access_record,
     decode_episode,
     decode_forget_marker,
     decode_memory,
+    encode_access_record,
     encode_episode,
     encode_forget_marker,
     encode_memory,
@@ -31,7 +34,7 @@ from .store_backend import (
     MemoryWithVector,
     VectorRow,
 )
-from .types import Episode, ForgetMarker, Memory
+from .types import AccessRecord, Episode, ForgetMarker, Memory
 
 # ──────────────────────────────────────────────
 # DDL
@@ -60,7 +63,8 @@ CREATE TABLE IF NOT EXISTS memories (
     last_activated TEXT NOT NULL DEFAULT '',
     reading TEXT,
     indexed INTEGER NOT NULL DEFAULT 1,
-    private INTEGER NOT NULL DEFAULT 0
+    private INTEGER NOT NULL DEFAULT 0,
+    source_ids TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_memories_emotion    ON memories(emotion);
 CREATE INDEX IF NOT EXISTS idx_memories_category   ON memories(category);
@@ -86,9 +90,24 @@ CREATE INDEX IF NOT EXISTS idx_coactivation_target ON coactivation(target_id);
 CREATE TABLE IF NOT EXISTS forget_markers (
     memory_id TEXT PRIMARY KEY,
     forgotten_at TEXT NOT NULL,
-    reason TEXT
+    reason TEXT,
+    scope TEXT NOT NULL DEFAULT 'memory',
+    linked_ids TEXT NOT NULL DEFAULT '',
+    conversation_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_forget_markers_at ON forget_markers(forgotten_at);
+
+-- K28: 本人だけの面を運営が読んだ記録。本文は持たない（読んだ記憶は id だけ）。
+CREATE TABLE IF NOT EXISTS access_log (
+    id TEXT PRIMARY KEY,
+    read_at TEXT NOT NULL,
+    reader TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    consent_source TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    memory_ids TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_access_log_at ON access_log(read_at);
 
 CREATE TABLE IF NOT EXISTS episodes (
     id TEXT PRIMARY KEY,
@@ -108,6 +127,14 @@ CREATE TABLE IF NOT EXISTS episodes (
 _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("indexed", "INTEGER NOT NULL DEFAULT 1"),
     ("private", "INTEGER NOT NULL DEFAULT 0"),
+    ("source_ids", "TEXT NOT NULL DEFAULT ''"),  # K28
+)
+
+# K28 より前の memory.db には無い列（forget_markers 表）。
+_ADDED_FORGET_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("scope", "TEXT NOT NULL DEFAULT 'memory'"),
+    ("linked_ids", "TEXT NOT NULL DEFAULT ''"),
+    ("conversation_count", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 # K22 より前の memory.db には無い列（episodes 表）。
@@ -126,6 +153,10 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in _ADDED_EPISODE_COLUMNS:
         if name not in existing_episode:
             conn.execute(f"ALTER TABLE episodes ADD COLUMN {name} {ddl}")
+    existing_forget = {row["name"] for row in conn.execute("PRAGMA table_info(forget_markers)")}
+    for name, ddl in _ADDED_FORGET_COLUMNS:
+        if name not in existing_forget:
+            conn.execute(f"ALTER TABLE forget_markers ADD COLUMN {name} {ddl}")
 
 
 # ──────────────────────────────────────────────
@@ -547,6 +578,38 @@ class SqliteMemoryStore:
                     (max(0, limit),),
                 ).fetchall()
             return [decode_forget_marker(dict(row)) for row in rows]
+
+        return await asyncio.to_thread(_fetch)
+
+    async def shred_conversation_copies(self, conversation_ids: tuple[str, ...]) -> int:
+        """SQLite（ローカル版）は会話の写しを持たないので、消すものは無い。"""
+        return 0
+
+    # ── 読まれた記録（K28）──────────────────
+
+    async def put_access_record(self, record: AccessRecord) -> None:
+        db = self._ensure_connected()
+        attrs = encode_access_record(record)
+
+        def _put() -> None:
+            columns = ", ".join(ACCESS_ATTRIBUTES)
+            placeholders = ",".join("?" * len(ACCESS_ATTRIBUTES))
+            db.execute(
+                f"INSERT OR REPLACE INTO access_log ({columns}) VALUES ({placeholders})",
+                [attrs[name] for name in ACCESS_ATTRIBUTES],
+            )
+            db.commit()
+
+        await asyncio.to_thread(_put)
+
+    async def fetch_access_records(self, limit: int) -> list[AccessRecord]:
+        db = self._ensure_connected()
+
+        def _fetch() -> list[AccessRecord]:
+            rows = db.execute(
+                "SELECT * FROM access_log ORDER BY read_at DESC LIMIT ?", (max(0, limit),)
+            ).fetchall()
+            return [decode_access_record(dict(row)) for row in rows]
 
         return await asyncio.to_thread(_fetch)
 

@@ -13,6 +13,8 @@ from typing import Any
 
 from .store_backend import MemoryRecord
 from .types import (
+    FORGET_SCOPE_MEMORY,
+    AccessRecord,
     CameraPosition,
     Episode,
     ForgetMarker,
@@ -46,12 +48,28 @@ MEMORY_ATTRIBUTES: tuple[str, ...] = (
     # 段2: 本人が決める 2 つの面。0/1 で持つ（DynamoDB の BOOL と SQLite の INTEGER を揃えるため）
     "indexed",
     "private",
+    # K28: 元になった会話の写しの id（id だけ）
+    "source_ids",
 )
 
 FORGET_ATTRIBUTES: tuple[str, ...] = (
     "memory_id",
     "forgotten_at",
     "reason",
+    # K28
+    "scope",
+    "linked_ids",
+    "conversation_count",
+)
+
+ACCESS_ATTRIBUTES: tuple[str, ...] = (
+    "id",
+    "read_at",
+    "reader",
+    "purpose",
+    "consent_source",
+    "expires_at",
+    "memory_ids",
 )
 
 EPISODE_ATTRIBUTES: tuple[str, ...] = (
@@ -144,6 +162,7 @@ def encode_memory(record: MemoryRecord) -> dict[str, Any]:
         "reading": record.reading,
         "indexed": 1 if memory.indexed else 0,
         "private": 1 if memory.private else 0,
+        "source_ids": ",".join(memory.source_ids),
     }
 
 
@@ -180,6 +199,8 @@ def decode_memory(
         # 段2 より前に保管された行には列が無い。既定は「索引に載る・本人だけの面ではない」。
         indexed=_as_flag(attrs.get("indexed"), default=True),
         private=_as_flag(attrs.get("private"), default=False),
+        # K28 より前の行には無い
+        source_ids=parse_linked_ids(attrs.get("source_ids") or ""),
     )
 
 
@@ -239,12 +260,46 @@ def encode_forget_marker(marker: ForgetMarker) -> dict[str, Any]:
         "memory_id": marker.memory_id,
         "forgotten_at": marker.forgotten_at,
         "reason": marker.reason or None,
+        "scope": marker.scope,
+        "linked_ids": ",".join(marker.linked_ids),
+        "conversation_count": int(marker.conversation_count),
     }
 
 
 def decode_forget_marker(attrs: Mapping[str, Any]) -> ForgetMarker:
+    # K28 より前の跡には scope などが無い（＝記憶だけを忘れた）
     return ForgetMarker(
         memory_id=attrs["memory_id"],
         forgotten_at=attrs["forgotten_at"],
-        reason=attrs["reason"] or None,
+        reason=attrs.get("reason") or None,
+        scope=attrs.get("scope") or FORGET_SCOPE_MEMORY,
+        linked_ids=parse_linked_ids(attrs.get("linked_ids") or ""),
+        conversation_count=int(attrs.get("conversation_count") or 0),
+    )
+
+
+# ── 読まれた記録（K28）──────────────────────
+
+
+def encode_access_record(record: AccessRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "read_at": record.read_at,
+        "reader": record.reader,
+        "purpose": record.purpose,
+        "consent_source": record.consent_source,
+        "expires_at": record.expires_at,
+        "memory_ids": ",".join(record.memory_ids),
+    }
+
+
+def decode_access_record(attrs: Mapping[str, Any]) -> AccessRecord:
+    return AccessRecord(
+        id=attrs["id"],
+        read_at=attrs["read_at"],
+        reader=attrs["reader"],
+        purpose=attrs["purpose"],
+        consent_source=attrs["consent_source"],
+        expires_at=attrs["expires_at"],
+        memory_ids=parse_linked_ids(attrs.get("memory_ids") or ""),
     )

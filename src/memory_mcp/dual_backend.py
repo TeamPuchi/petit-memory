@@ -20,7 +20,7 @@ from .store_backend import (
     MemoryWithVector,
     VectorRow,
 )
-from .types import Episode, ForgetMarker, Memory
+from .types import AccessRecord, Episode, ForgetMarker, Memory
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +185,9 @@ class DualWriteMemoryStore:
     async def fetch_indexed_memory_ids(self) -> list[str]:
         return await self._primary.fetch_indexed_memory_ids()
 
+    async def fetch_access_records(self, limit: int) -> list[AccessRecord]:
+        return await self._primary.fetch_access_records(limit)
+
     async def fetch_neighbors(self, memory_id: str) -> tuple[Memory | None, Memory | None]:
         return await self._primary.fetch_neighbors(memory_id)
 
@@ -212,6 +215,16 @@ class DualWriteMemoryStore:
         result = await self._primary.delete_memory(memory_id, forget_marker)
         await self._replicate("delete_memory", memory_id, forget_marker)
         return result
+
+    async def shred_conversation_copies(self, conversation_ids: tuple[str, ...]) -> int:
+        # 会話の写しの鍵は secondary（DynamoDB）側にしか無い。primary（SQLite）は 0 を返す
+        result = await self._primary.shred_conversation_copies(conversation_ids)
+        await self._replicate("shred_conversation_copies", conversation_ids)
+        return result
+
+    async def put_access_record(self, record: AccessRecord) -> None:
+        await self._primary.put_access_record(record)
+        await self._replicate("put_access_record", record)
 
     async def add_bidirectional_link(self, source_id: str, target_id: str) -> None:
         await self._primary.add_bidirectional_link(source_id, target_id)

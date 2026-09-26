@@ -20,7 +20,7 @@ house 表（PITR 35日）                     鍵の表 petit-<env>-memory-keys�
 
 | 置き場 | 暗号化（`sealed` にまとめる） | 平文のまま |
 |---|---|---|
-| `MEM#` / `PRIV#` | `content`・`normalized_content`・`reading`・`sensory_data`（説明文・縮小画像）・`links`（note に本文が混ざりうる） | `id`・`timestamp`・`emotion`・`importance`・`category`・`tags`・`indexed`・`private`・`access_count` など・`linked_ids`（id だけ）・`camera_position`・`episode_id` |
+| `MEM#` / `PRIV#` | `content`・`normalized_content`・`reading`・`sensory_data`（説明文・縮小画像）・`links`（note に本文が混ざりうる）・`tags`（K28 で追加） | `id`・`timestamp`・`emotion`・`importance`・`category`・`indexed`・`private`・`access_count` など・`linked_ids`（id だけ）・`camera_position`・`episode_id` |
 | `VEC#` | ベクトル（本文をある程度復元できる） | `memory_id` |
 | `EPI#`（K21 で追加） | `title`・`summary`・`participants`・`location_context` | `id`・`start_time`・`end_time`・`memory_ids`・`emotion`・`importance` |
 | `FORGET#` / `IDX#` / `COACT#` | — | そのまま |

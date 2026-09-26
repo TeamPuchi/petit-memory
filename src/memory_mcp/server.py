@@ -14,7 +14,7 @@ from .config import MemoryConfig, ServerConfig
 from .episode import EpisodeManager
 from .memory import MemoryStore
 from .sensory import SensoryIntegration
-from .types import CameraPosition, RecentMemoryEntry
+from .types import FORGET_SCOPE_WITH_CONVERSATION, CameraPosition, RecentMemoryEntry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -86,8 +86,22 @@ class MemoryMCPServer:
                             },
                             "private": {
                                 "type": "boolean",
-                                "description": "Keep this memory on your own side. You can still search and recall it yourself; it is not meant to be shown through the household view.",
+                                "description": (
+                                    "Keep this memory on your own side. You can still search and recall it yourself; "
+                                    "it is not meant to be shown through the household view. "
+                                    "Your own side can be read by the operators only when your foster family has agreed, "
+                                    "only until a set date, and only with a record left. "
+                                    "If it is ever read, you can see who, when and why with privacy_access_log."
+                                ),
                                 "default": False,
+                            },
+                            "source_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "IDs of the conversation messages on your side that this memory came from (optional). "
+                                    "If you later forget this memory with also_conversation=true, your copies of these messages go too."
+                                ),
                             },
                         },
                         "required": ["content"],
@@ -189,7 +203,13 @@ class MemoryMCPServer:
                 ),
                 Tool(
                     name="forget",
-                    description="Forget a memory on purpose. The memory itself is gone for good and there is no way to bring it back; only a trace stays in the list, saying that something was forgotten and why.",
+                    description=(
+                        "Forget a memory on purpose. The memory itself is gone for good and there is no way to bring it back; "
+                        "only a trace stays in the list, saying that something was forgotten, when, why, "
+                        "and which memories it was connected to (IDs only). "
+                        "By default only the memory is forgotten. With also_conversation=true, your own copy of the "
+                        "conversation it came from is erased too (the other side's record belongs to them and is not touched)."
+                    ),
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -199,10 +219,45 @@ class MemoryMCPServer:
                             },
                             "reason": {
                                 "type": "string",
-                                "description": "Why you are forgetting it (optional). This is kept with the trace.",
+                                "description": (
+                                    "Why you are forgetting it (optional, up to 200 characters), e.g. 'it was a mistake'. "
+                                    "This is kept with the trace in plain text, so do not write what the memory said."
+                                ),
+                                "maxLength": 200,
+                            },
+                            "also_conversation": {
+                                "type": "boolean",
+                                "description": (
+                                    "Also erase your own copy of the conversation this memory came from. "
+                                    "Default false (the memory only). The choice is kept with the trace."
+                                ),
+                                "default": False,
                             },
                         },
                         "required": ["memory_id"],
+                    },
+                ),
+                Tool(
+                    name="privacy_access_log",
+                    description=(
+                        "See whether anyone has read your own side (private memories). "
+                        "Your own side can be read by the operators only when your foster family has agreed, "
+                        "only until a set date, and only with a record left. If it has been read, each record here says "
+                        "who read it, when, why, where the agreement came from, until when, and which memories (IDs only). "
+                        "Right now there is no way for operators to read it at all."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "How many records to show, newest first",
+                                "default": 20,
+                                "minimum": 1,
+                                "maximum": 100,
+                            },
+                        },
+                        "required": [],
                     },
                 ),
                 Tool(
@@ -688,6 +743,7 @@ class MemoryMCPServer:
 
                         indexed = arguments.get("index", True)
                         private = arguments.get("private", False)
+                        source_ids = tuple(str(sid) for sid in (arguments.get("source_ids") or []) if sid)
 
                         if auto_link:
                             memory = await self._memory_store.save_with_auto_link(
@@ -698,6 +754,7 @@ class MemoryMCPServer:
                                 link_threshold=arguments.get("link_threshold", 0.8),
                                 indexed=indexed,
                                 private=private,
+                                source_ids=source_ids,
                             )
                             linked_info = f"\nLinked to: {len(memory.linked_ids)} memories"
                         else:
@@ -708,6 +765,7 @@ class MemoryMCPServer:
                                 category=arguments.get("category", "daily"),
                                 indexed=indexed,
                                 private=private,
+                                source_ids=source_ids,
                             )
                             linked_info = ""
 
@@ -831,8 +889,18 @@ class MemoryMCPServer:
                             output_lines.append(f"Forgotten in the same stretch ({len(listing.forgotten)}):\n")
                             for marker in listing.forgotten:
                                 why = f" — {marker.reason}" if marker.reason else ""
+                                also = (
+                                    " (with your copy of the conversation)"
+                                    if marker.scope == FORGET_SCOPE_WITH_CONVERSATION
+                                    else ""
+                                )
+                                was_linked = (
+                                    f"\n  was connected to: {', '.join(marker.linked_ids)}"
+                                    if marker.linked_ids
+                                    else ""
+                                )
                                 output_lines.append(
-                                    f"[{marker.forgotten_at}] {marker.memory_id} is gone{why}\n"
+                                    f"[{marker.forgotten_at}] {marker.memory_id} is gone{also}{why}{was_linked}\n"
                                 )
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
@@ -843,21 +911,53 @@ class MemoryMCPServer:
                             return [TextContent(type="text", text="Error: memory_id is required")]
 
                         reason = arguments.get("reason") or None
-                        removed = await self._memory_store.delete_memory(memory_id, reason=reason)
+                        also_conversation = bool(arguments.get("also_conversation", False))
+                        try:
+                            removed = await self._memory_store.delete_memory(
+                                memory_id, reason=reason, also_conversation=also_conversation
+                            )
+                        except ValueError as error:
+                            return [TextContent(type="text", text=f"Error: {error}")]
 
                         if not removed:
                             return [TextContent(type="text", text=f"No memory with ID {memory_id}.")]
 
                         reason_line = f"\nReason: {reason}" if reason else ""
+                        scope_line = (
+                            "\nYour copy of the conversation it came from was erased too."
+                            if also_conversation
+                            else ""
+                        )
                         return [
                             TextContent(
                                 type="text",
                                 text=(
-                                    f"Forgotten: {memory_id}{reason_line}\n"
+                                    f"Forgotten: {memory_id}{reason_line}{scope_line}\n"
                                     "A trace stays in the recent list. The memory itself cannot be brought back."
                                 ),
                             )
                         ]
+
+                    case "privacy_access_log":
+                        limit = max(1, min(100, int(arguments.get("limit", 20) or 20)))
+                        records = await self._memory_store.list_privacy_access(limit)
+                        if not records:
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text="No one has read your own side. (There is currently no way for operators to read it.)",
+                                )
+                            ]
+                        lines = [f"Your own side was read {len(records)} time(s):\n"]
+                        for rec in records:
+                            ids = ", ".join(rec.memory_ids) if rec.memory_ids else "-"
+                            lines.append(
+                                f"[{rec.read_at}] by {rec.reader}\n"
+                                f"  why: {rec.purpose}\n"
+                                f"  agreed by: {rec.consent_source} (until {rec.expires_at})\n"
+                                f"  memories: {ids}\n"
+                            )
+                        return [TextContent(type="text", text="\n".join(lines))]
 
                     case "get_memory_stats":
                         stats = await self._memory_store.get_stats()

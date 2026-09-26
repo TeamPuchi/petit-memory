@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from .config import MemoryConfig
-from .types import Episode, ForgetMarker, Memory
+from .types import AccessRecord, Episode, ForgetMarker, Memory
 
 # `update_memory_fields` で書き換えてよい属性。保管先が変わっても同じ名前を使う。
 UPDATABLE_FIELDS: frozenset[str] = frozenset(
@@ -178,6 +178,26 @@ class MemoryStoreBackend(Protocol):
 
     async def fetch_forget_markers(self, since: str | None, limit: int) -> list[ForgetMarker]:
         """消した跡を新しい順に取る。`since` 以降に絞る（None なら全部）。"""
+        ...
+
+    async def shred_conversation_copies(self, conversation_ids: tuple[str, ...]) -> int:
+        """自分の側の会話の写し（MSG# など）の鍵を消す（K28）。消した件数を返す。
+
+        会話の写しは m5-petit-app が同じ鍵の表（`KEY#<id>`）で暗号化している。鍵を消せば、
+        本体の行がどこに残っていても読めない。鍵の表は pid ごとなので、消せるのは自分の側の写しだけ。
+        記憶・エピソードの id を渡されても消さない（取り違えで別の記憶を壊さないため）。
+        暗号シュレッダーの無い保管先（SQLite・平文の DynamoDB）では会話を持たないので 0。
+        """
+        ...
+
+    # ── 読まれた記録（K28）──────────────────
+
+    async def put_access_record(self, record: AccessRecord) -> None:
+        """本人だけの面を運営が読んだ記録を書く。読む口を作るとき、読む前に必ず呼ぶ。"""
+        ...
+
+    async def fetch_access_records(self, limit: int) -> list[AccessRecord]:
+        """読まれた記録を新しい順に取る（ぷち本人が見る）。"""
         ...
 
     # ── 一覧の材料（段2）──────────────────────

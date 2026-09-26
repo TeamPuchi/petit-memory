@@ -43,6 +43,10 @@ from .store_backend import (
     create_backend,
 )
 from .types import (
+    FORGET_REASON_MAX_CHARS,
+    FORGET_SCOPE_MEMORY,
+    FORGET_SCOPE_WITH_CONVERSATION,
+    AccessRecord,
     CameraPosition,
     Episode,
     ForgetMarker,
@@ -178,8 +182,12 @@ class MemoryStore:
         tags: tuple[str, ...] = (),
         indexed: bool = True,
         private: bool = False,
+        source_ids: tuple[str, ...] = (),
     ) -> Memory:
         """Save a new memory.
+
+        K28: `source_ids` はこの記憶の元になった自分の側の会話の写し（MSG# など）の id。
+        忘れるときに「会話も消す」を選ぶと、これらの鍵も消す。
 
         段2: `indexed=False` なら意味検索・recall・random の母集団から外す（ID 指定では取れる）。
         `private=True` なら本人だけの面に置く（DynamoDB では `PRIV#`）。
@@ -201,6 +209,7 @@ class MemoryStore:
             tags=tags,
             indexed=indexed,
             private=private,
+            source_ids=tuple(sid.strip() for sid in source_ids if sid and sid.strip()),
         )
 
         normalized_content = normalize_japanese(content)
@@ -509,6 +518,7 @@ class MemoryStore:
         *,
         reason: str | None = None,
         leave_trace: bool = True,
+        also_conversation: bool = False,
     ) -> bool:
         """Delete a memory and clean up references.
 
@@ -517,12 +527,41 @@ class MemoryStore:
 
         `leave_trace=False` は統合（`merge_memories`）用。あちらは忘却ではなく、
         中身が新しい 1 件に引き継がれるので跡を残さない。
+
+        K28:
+        - `also_conversation=True` なら、この記憶の元になった自分の側の会話の写し
+          （`Memory.source_ids`）の鍵も消す。既定は記憶だけ。相手の側の記録には触れない。
+        - 跡には選んだ範囲（`scope`）・つながっていた記憶の id・会話を何件消したかを残す。
+        - `reason` は `FORGET_REASON_MAX_CHARS` 字まで。超えたら `ValueError`（本文の写しを跡に置かせない）。
         """
+        reason = (reason or "").strip() or None
+        if reason is not None and len(reason) > FORGET_REASON_MAX_CHARS:
+            raise ValueError(
+                f"reason is too long ({len(reason)} > {FORGET_REASON_MAX_CHARS} characters). "
+                "Keep it short and do not copy what the memory said."
+            )
+
+        # 読めない（鍵だけ先に消えて途中で止まった）記憶も、残りの行の掃除はできるように先へ進む
+        target = await self._backend.fetch_memory(memory_id)
+        source_ids = target.source_ids if target is not None else ()
+        linked_source = (
+            [*target.linked_ids, *(link.target_id for link in target.links)] if target is not None else []
+        )
+
+        conversation_count = 0
+        if also_conversation and source_ids:
+            # 記憶より先に会話の鍵を消す（途中で落ちても「読めない」側に倒れる）
+            conversation_count = await self._backend.shred_conversation_copies(source_ids)
+
+        linked = tuple(dict.fromkeys(linked_source))
         marker = (
             ForgetMarker(
                 memory_id=memory_id,
                 forgotten_at=datetime.now().isoformat(),
                 reason=reason,
+                scope=FORGET_SCOPE_WITH_CONVERSATION if also_conversation else FORGET_SCOPE_MEMORY,
+                linked_ids=tuple(lid for lid in linked if lid and lid != memory_id),
+                conversation_count=conversation_count,
             )
             if leave_trace
             else None
@@ -537,6 +576,41 @@ class MemoryStore:
     async def list_forget_markers(self, since: str | None = None, limit: int = 10) -> list[ForgetMarker]:
         """消した跡を新しい順に取る。"""
         return await self._backend.fetch_forget_markers(since, limit)
+
+    # ── 読まれた記録（K28）──────────────────
+
+    async def record_privacy_access(
+        self,
+        *,
+        reader: str,
+        purpose: str,
+        consent_source: str,
+        expires_at: str,
+        memory_ids: tuple[str, ...] = (),
+    ) -> AccessRecord:
+        """本人だけの面を運営が読む**前に**書く記録。いまは呼ぶ口が無い（読む手段が無い）。
+
+        読む口を作るとき（総合試験以降・Q-81(d)）は、同意の出典と期限が揃っていなければ読ませない。
+        """
+        required = {"reader": reader, "purpose": purpose, "consent_source": consent_source, "expires_at": expires_at}
+        for name, value in required.items():
+            if not value or not value.strip():
+                raise ValueError(f"{name} is required to read a private memory")
+        record = AccessRecord(
+            id=str(uuid.uuid4()),
+            read_at=datetime.now().isoformat(),
+            reader=reader.strip(),
+            purpose=purpose.strip(),
+            consent_source=consent_source.strip(),
+            expires_at=expires_at.strip(),
+            memory_ids=tuple(memory_ids),
+        )
+        await self._backend.put_access_record(record)
+        return record
+
+    async def list_privacy_access(self, limit: int = 20) -> list[AccessRecord]:
+        """本人だけの面が読まれた記録を新しい順に取る（ぷち本人が見る）。"""
+        return await self._backend.fetch_access_records(limit)
 
     # ── merge_memories ─────────────────────────
 
@@ -700,6 +774,7 @@ class MemoryStore:
         max_links: int = 5,
         indexed: bool = True,
         private: bool = False,
+        source_ids: tuple[str, ...] = (),
     ) -> Memory:
         similar_memories = await self.search(query=content, n_results=max_links)
         memories_to_link = [r.memory for r in similar_memories if r.distance <= link_threshold]
@@ -719,6 +794,7 @@ class MemoryStore:
             linked_ids=linked_ids,
             indexed=indexed,
             private=private,
+            source_ids=tuple(sid.strip() for sid in source_ids if sid and sid.strip()),
         )
 
         normalized_content = normalize_japanese(content)
