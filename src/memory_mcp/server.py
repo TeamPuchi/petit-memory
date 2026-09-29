@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -486,7 +487,12 @@ class MemoryMCPServer:
                 # Phase 4.3: Sensory Integration Tools
                 Tool(
                     name="save_visual_memory",
-                    description="Save a memory with visual data (image path and camera position). Use this when you see something with your camera.",
+                    description=(
+                        "Save a memory with visual data (image path and, if your camera has one, its pan/tilt position). "
+                        "Use this when you see something with your camera, or when you look at a photo you want to "
+                        "remember as it looked (the house tools give you the image_path and photo_id). "
+                        "The image is kept small and blurry, like a human memory."
+                    ),
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -498,9 +504,13 @@ class MemoryMCPServer:
                                 "type": "string",
                                 "description": "Path to the captured image file",
                             },
+                            "photo_id": {
+                                "type": "string",
+                                "description": "Album photo ID, when the image is a photo in the house album (optional)",
+                            },
                             "camera_position": {
                                 "type": "object",
-                                "description": "Camera pan/tilt position",
+                                "description": "Camera pan/tilt position (optional; leave it out for a camera that cannot turn, or for a photo)",
                                 "properties": {
                                     "pan_angle": {
                                         "type": "integer",
@@ -537,7 +547,7 @@ class MemoryMCPServer:
                                 "enum": ["low", "medium", "high"],
                             },
                         },
-                        "required": ["content", "image_path", "camera_position"],
+                        "required": ["content", "image_path"],
                     },
                 ),
                 Tool(
@@ -1225,16 +1235,22 @@ Date Range:
                         if not image_path:
                             return [TextContent(type="text", text="Error: image_path is required")]
 
-                        camera_pos_data = arguments.get("camera_position")
-                        if not camera_pos_data:
-                            return [TextContent(type="text", text="Error: camera_position is required")]
+                        if not os.path.isfile(image_path):
+                            # 家の道具が置く一時ファイルは半日で消える。消えていたら黙って画像なしで残さない
+                            return [TextContent(type="text", text=(
+                                f"Error: image not found: {image_path} "
+                                "(look at it again to get a fresh image_path, or use remember for words only)"))]
 
-                        # Create CameraPosition from dict
-                        camera_position = CameraPosition(
-                            pan_angle=camera_pos_data["pan_angle"],
-                            tilt_angle=camera_pos_data["tilt_angle"],
-                            preset_id=camera_pos_data.get("preset_id"),
-                        )
+                        # カメラの向きは省ける（向きを持たないカメラ・アルバムの写真）
+                        camera_pos_data = arguments.get("camera_position")
+                        camera_position = None
+                        if camera_pos_data:
+                            camera_position = CameraPosition(
+                                pan_angle=camera_pos_data["pan_angle"],
+                                tilt_angle=camera_pos_data["tilt_angle"],
+                                preset_id=camera_pos_data.get("preset_id"),
+                            )
+                        photo_id = arguments.get("photo_id") or None
 
                         memory = await self._sensory_integration.save_visual_memory(
                             content=content,
@@ -1243,8 +1259,14 @@ Date Range:
                             emotion=arguments.get("emotion", "neutral"),
                             importance=arguments.get("importance", 3),
                             resolution=arguments.get("resolution"),
+                            photo_id=photo_id,
                         )
 
+                        camera_line = (
+                            f"Camera: pan={camera_position.pan_angle}°, tilt={camera_position.tilt_angle}°\n"
+                            if camera_position is not None else ""
+                        )
+                        photo_line = f"Photo: {photo_id}\n" if photo_id else ""
                         return [
                             TextContent(
                                 type="text",
@@ -1252,7 +1274,7 @@ Date Range:
                                      f"ID: {memory.id}\n"
                                      f"Content: {memory.content}\n"
                                      f"Image: {image_path}\n"
-                                     f"Camera: pan={camera_position.pan_angle}°, tilt={camera_position.tilt_angle}°\n"
+                                     f"{camera_line}{photo_line}"
                                      f"Emotion: {memory.emotion} | Importance: {memory.importance}",
                             )
                         ]

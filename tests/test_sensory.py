@@ -76,6 +76,26 @@ class TestVisualMemory:
         assert sensory.metadata["camera_position"]["pan_angle"] == 45
         assert sensory.metadata["camera_position"]["tilt_angle"] == -20
 
+    @pytest.mark.asyncio
+    async def test_visual_memory_without_camera_position(self, sensory_integration, tmp_path):
+        """向きを持たないカメラ（クラウド版の機体）やアルバムの写真は、カメラの向きなしで残せる."""
+        from PIL import Image
+
+        path = tmp_path / "01J0000000000000000000000A.jpg"
+        Image.new("RGB", (1200, 900), (0, 97, 139)).save(path, format="JPEG")
+
+        memory = await sensory_integration.save_visual_memory(
+            content="里親さんの机の上に、青いマグカップがあった",
+            image_path=str(path),
+            photo_id="01J0000000000000000000000A",
+        )
+
+        assert memory.camera_position is None
+        sensory = memory.sensory_data[0]
+        assert "camera_position" not in sensory.metadata
+        assert sensory.metadata["photo_id"] == "01J0000000000000000000000A"
+        assert sensory.image_data  # 見た目も小さくして残る
+
 
 class TestAudioMemory:
     """Test audio memory operations."""
