@@ -109,7 +109,7 @@ uv remove --dev chromadb
 ```json
 {
   "content": "Today I learned about SQLite performance tuning",
-  "emotion": "excited",
+  "emotion": "わくわく",
   "importance": 4,
   "category": "technical"
 }
@@ -129,7 +129,7 @@ uv remove --dev chromadb
   "query": "things I learned about databases",
   "n_results": 5,
   "category_filter": "technical",
-  "emotion_filter": "excited"
+  "emotion_filter": "わくわく"
 }
 ```
 
@@ -254,7 +254,7 @@ uv remove --dev chromadb
   "content": "Saw a beautiful sunset from the balcony",
   "image_path": "/tmp/capture_20260220_183000.jpg",
   "camera_position": { "pan_angle": -30, "tilt_angle": 20 },
-  "emotion": "moved",
+  "emotion": "感動",
   "importance": 4
 }
 ```
@@ -268,7 +268,7 @@ uv remove --dev chromadb
   "content": "User said good morning",
   "audio_path": "/tmp/audio.wav",
   "transcript": "Good morning! How are you?",
-  "emotion": "happy"
+  "emotion": "うれしい"
 }
 ```
 
@@ -373,11 +373,11 @@ Theory of Mind: 視点取得ツール。応答前にこれを呼び出し、相�
 
 1. **Merge(統合)** — 同カテゴリの古い記憶のうち、コサイン類似度が閾値を超えるものをグループ化し、1つの要約記憶にまとめる
 2. **Decay(減衰)** — 保持スコアの低い記憶の重要度を下げる(1未満にはならない)
-3. **Forget(忘却)** — 重要度=1・感情=neutral・エピソード非所属・十分に古い・アクセス頻度が低い記憶を削除する
+3. **Forget(忘却)** — 重要度=1・感情なし（空・neutral）・エピソード非所属・十分に古い・アクセス頻度が低い記憶を削除する
 
 **保護ルール(絶対に変更されない):**
 - `importance >= 4`
-- 感情が`happy`・`moved`・`excited`・`surprised`のいずれか
+- 感情が`happy`・`moved`・`excited`・`surprised`のいずれか、またはその仲間の日本語（下の「感情ラベル」）
 - 内容に「初めて」「はじめて」「first time」を含む(初めての経験)
 - エピソードに含まれる記憶(削除は不可、減衰は可)
 
@@ -432,7 +432,27 @@ asyncio.run(main())
 
 ## 感情ラベル
 
-`happy`, `sad`, `surprised`, `moved`, `excited`, `nostalgic`, `curious`, `neutral`
+感情は、ぷちが自分の言葉で書く日本語の一語（「うれしい」「楽しい」「愉しい」「しみじみ」など）。決まった語から選ばない。
+保存するのは書いた言葉そのままで、「楽しい」と「愉しい」の違いも残る。気持ちが無ければ空。
+
+強さ（思い出しやすさ・寝ている間の整理で残る点数）と「消されない」は、元の作り（embodied-claude の memory-mcp）の
+英語 8 語の表をそのまま使い、日本語の言葉を「どの語の仲間か」に割り当てて引く（`src/memory_mcp/emotion.py`）。
+
+| 元の語 | 強さ | 消されない | 仲間の日本語の例 |
+|---|---|---|---|
+| excited | 0.4 | ○ | わくわく・どきどき・楽しみ |
+| surprised | 0.35 | ○ | おどろいた・びっくり |
+| moved | 0.3 | ○ | 感動・感激・感謝・じーん |
+| sad | 0.25 | | かなしい・さみしい・切ない・くやしい・こわい・不安・むっとした |
+| happy | 0.2 | ○ | うれしい・楽しい・愉しい・幸せ・よかった |
+| nostalgic | 0.15 | | なつかしい・しみじみ |
+| curious | 0.1 | | きになる・ふしぎ・知りたい |
+| neutral | 0.0 | | （空）・ふつう・なし |
+
+- 表に無い日本語の言葉は中くらい（0.25）。消されないの対象ではないが、気持ちが付いているので忘れる対象にもならない
+- 「楽しかった」のような言い回しは書き出し（「楽し」）で引く
+- 古い英語の値（`happy` など）は保存を変えず、挙動も元のまま。表示のときだけ日本語にする（`joy`・`happy`→うれしい など）
+- 感情で絞る（`emotion_filter`）と、同じ訳になる古い英語の記憶も拾う（「うれしい」→ `happy`・`joy` も）
 
 ## カテゴリラベル
 
@@ -473,7 +493,7 @@ m5-petit-memory/
 │   ├── episode.py      # EpisodeManager(MemoryStoreに委譲)
 │   ├── sleep.py         # 統合・減衰・忘却サイクル
 │   ├── config.py       # 設定
-│   └── types.py        # 感情・カテゴリのenum
+│   └── types.py        # 感情（古い値）・カテゴリのenum
 ├── scripts/
 │   └── migrate_chroma_to_sqlite.py  # ChromaDB → SQLite移行
 └── tests/

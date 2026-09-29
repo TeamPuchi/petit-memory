@@ -671,12 +671,15 @@ class DynamoMemoryStore:
 
     async def fetch_memories_with_vectors(
         self,
-        emotion: str | None = None,
+        emotion: str | tuple[str, ...] | None = None,
         category: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
     ) -> list[MemoryWithVector]:
         """`MEM#` を（期間は sk の範囲で）絞って取り、`VEC#<id>` を引き当てて組にする。"""
+
+        # 感情は保存値の組（emotion.emotion_filter_values）で来る。1 語でも受ける
+        emotions = None if not emotion else ((emotion,) if isinstance(emotion, str) else tuple(emotion))
 
         def _fetch() -> list[MemoryWithVector]:
             # 期間は sk の範囲で粗く絞り、境界の比較は SQLite と同じ文字列比較で仕上げる
@@ -687,7 +690,7 @@ class DynamoMemoryStore:
                 for item in items
                 # 段2: index:false は意味検索・recall の母集団に入れない
                 if _is_indexed(item)
-                and (emotion is None or item.get("emotion") == emotion)
+                and (emotions is None or item.get("emotion", "") in emotions)
                 and (category is None or item.get("category") == category)
                 and (date_from is None or str(item["timestamp"]) >= date_from)
                 and (date_to is None or str(item["timestamp"]) <= date_to)

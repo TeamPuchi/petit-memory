@@ -11,10 +11,40 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from .config import MemoryConfig, ServerConfig
+from .emotion import emotion_label
 from .episode import EpisodeManager
 from .memory import MemoryStore
 from .sensory import SensoryIntegration
 from .types import FORGET_SCOPE_WITH_CONVERSATION, CameraPosition, RecentMemoryEntry
+
+# remember などの emotion の説明（ぷちが自分の言葉で書く。英語の決まった語に閉じない）
+EMOTION_DESCRIPTION = (
+    "このときの自分の気持ちを、自分の言葉の日本語一語で"
+    "（例: うれしい・楽しい・愉しい・わくわく・おどろいた・感動・しみじみ・なつかしい・かなしい・さみしい・きになる）。"
+    "決まった語から選ばなくてよい。「楽しい」と「愉しい」のような違いもそのまま残る。"
+    "気持ちが特に無ければ空のまま"
+)
+
+
+def _emotion_tag(emotion: str | None) -> str:
+    """一覧の見出しに付ける " [うれしい]"。古い英語の値は日本語に。気持ちが無ければ付けない."""
+    label = emotion_label(emotion)
+    return f" [{label}]" if label else ""
+
+
+def _emotion_text(emotion: str | None) -> str:
+    """「Emotion: …」の値。気持ちが無ければ「なし」."""
+    return emotion_label(emotion) or "なし"
+
+
+def _emotion_counts(by_emotion: dict[str, int]) -> dict[str, int]:
+    """統計の感情別の数を、表示の日本語でまとめ直す（happy と joy は「うれしい」に合算）."""
+    counts: dict[str, int] = {}
+    for emotion, count in by_emotion.items():
+        key = _emotion_text(emotion)
+        counts[key] = counts.get(key, 0) + count
+    return counts
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -50,9 +80,8 @@ class MemoryMCPServer:
                             },
                             "emotion": {
                                 "type": "string",
-                                "description": "Emotion associated with this memory",
-                                "default": "neutral",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                                "description": EMOTION_DESCRIPTION,
+                                "default": "",
                             },
                             "importance": {
                                 "type": "integer",
@@ -126,8 +155,10 @@ class MemoryMCPServer:
                             },
                             "emotion_filter": {
                                 "type": "string",
-                                "description": "Filter by emotion (optional)",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                                "description": (
+                                    "気持ちの言葉で絞る（任意。例: うれしい）。"
+                                    "日本語で探すと、同じ気持ちの古い英語の記憶（happy・joy など）も拾う"
+                                ),
                             },
                             "category_filter": {
                                 "type": "string",
@@ -519,9 +550,8 @@ class MemoryMCPServer:
                             },
                             "emotion": {
                                 "type": "string",
-                                "description": "Emotion",
-                                "default": "neutral",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                                "description": EMOTION_DESCRIPTION,
+                                "default": "",
                             },
                             "importance": {
                                 "type": "integer",
@@ -560,9 +590,8 @@ class MemoryMCPServer:
                             },
                             "emotion": {
                                 "type": "string",
-                                "description": "Emotion",
-                                "default": "neutral",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                                "description": EMOTION_DESCRIPTION,
+                                "default": "",
                             },
                             "importance": {
                                 "type": "integer",
@@ -748,7 +777,7 @@ class MemoryMCPServer:
                         if auto_link:
                             memory = await self._memory_store.save_with_auto_link(
                                 content=content,
-                                emotion=arguments.get("emotion", "neutral"),
+                                emotion=arguments.get("emotion", ""),
                                 importance=arguments.get("importance", 3),
                                 category=arguments.get("category", "daily"),
                                 link_threshold=arguments.get("link_threshold", 0.8),
@@ -760,7 +789,7 @@ class MemoryMCPServer:
                         else:
                             memory = await self._memory_store.save(
                                 content=content,
-                                emotion=arguments.get("emotion", "neutral"),
+                                emotion=arguments.get("emotion", ""),
                                 importance=arguments.get("importance", 3),
                                 category=arguments.get("category", "daily"),
                                 indexed=indexed,
@@ -778,7 +807,7 @@ class MemoryMCPServer:
                         return [
                             TextContent(
                                 type="text",
-                                text=f"Memory saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {memory.emotion}\nImportance: {memory.importance}\nCategory: {memory.category}{linked_info}",
+                                text=f"Memory saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {_emotion_text(memory.emotion)}\nImportance: {memory.importance}\nCategory: {memory.category}{linked_info}",
                             )
                         ]
 
@@ -810,7 +839,7 @@ class MemoryMCPServer:
                             output_lines.append(
                                 f"--- Memory {i} (distance: {result.distance:.4f}) ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}] [{m.category}] (importance: {m.importance})\n"
+                                f"[{m.timestamp}]{_emotion_tag(m.emotion)} [{m.category}] (importance: {m.importance})\n"
                                 f"{m.content}\n"
                                 f"{image_line}"
                             )
@@ -841,7 +870,7 @@ class MemoryMCPServer:
                             output_lines.append(
                                 f"--- Memory {i} ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}]\n"
+                                f"[{m.timestamp}]{_emotion_tag(m.emotion)}\n"
                                 f"{m.content}\n"
                                 f"{image_line}"
                             )
@@ -867,7 +896,7 @@ class MemoryMCPServer:
                             block = (
                                 f"--- Memory {index} ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}] [{m.category}]\n"
+                                f"[{m.timestamp}]{_emotion_tag(m.emotion)} [{m.category}]\n"
                                 f"{m.content}\n"
                             )
                             if entry.previous is not None:
@@ -969,7 +998,7 @@ By Category:
 {json.dumps(stats.by_category, indent=2, ensure_ascii=False)}
 
 By Emotion:
-{json.dumps(stats.by_emotion, indent=2, ensure_ascii=False)}
+{json.dumps(_emotion_counts(stats.by_emotion), indent=2, ensure_ascii=False)}
 
 Date Range:
   Oldest: {stats.oldest_timestamp or 'N/A'}
@@ -1003,7 +1032,7 @@ Date Range:
                             output_lines.append(
                                 f"--- Memory {i} (score: {result.distance:.4f}) ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}]\n"
+                                f"[{m.timestamp}]{_emotion_tag(m.emotion)}\n"
                                 f"{m.content}\n"
                             )
 
@@ -1014,7 +1043,7 @@ Date Range:
                                 output_lines.append(
                                     f"--- Linked {i} ---\n"
                                     f"ID: {m.id}\n"
-                                    f"[{m.timestamp}] [{m.emotion}]\n"
+                                    f"[{m.timestamp}]{_emotion_tag(m.emotion)}\n"
                                     f"{m.content}\n"
                                 )
 
@@ -1043,7 +1072,7 @@ Date Range:
                             output_lines.append(
                                 f"--- Memory {i} (score: {result.distance:.4f}) ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}] [{m.category}]\n"
+                                f"[{m.timestamp}]{_emotion_tag(m.emotion)} [{m.category}]\n"
                                 f"{m.content}\n"
                             )
 
@@ -1108,7 +1137,7 @@ Date Range:
                         output_lines.append("=== Starting Memory ===\n")
                         output_lines.append(
                             f"ID: {start_memory.id}\n"
-                            f"[{start_memory.timestamp}] [{start_memory.emotion}] [{start_memory.category}]\n"
+                            f"[{start_memory.timestamp}]{_emotion_tag(start_memory.emotion)} [{start_memory.category}]\n"
                             f"{start_memory.content}\n"
                             f"Linked to: {len(start_memory.linked_ids)} memories\n"
                         )
@@ -1118,7 +1147,7 @@ Date Range:
                             for i, m in enumerate(linked_memories, 1):
                                 output_lines.append(
                                     f"--- {i}. {m.id[:8]}... ---\n"
-                                    f"[{m.timestamp}] [{m.emotion}]\n"
+                                    f"[{m.timestamp}]{_emotion_tag(m.emotion)}\n"
                                     f"{m.content}\n"
                                 )
                         else:
@@ -1154,7 +1183,7 @@ Date Range:
                                      f"Title: {episode.title}\n"
                                      f"Memories: {len(episode.memory_ids)}\n"
                                      f"Time: {episode.start_time} - {episode.end_time}\n"
-                                     f"Emotion: {episode.emotion}\n"
+                                     f"Emotion: {_emotion_text(episode.emotion)}\n"
                                      f"Importance: {episode.importance}\n"
                                      f"Summary: {episode.summary[:100]}...",
                             )
@@ -1184,7 +1213,7 @@ Date Range:
                                 f"Title: {ep.title}\n"
                                 f"Time: {ep.start_time} - {ep.end_time}\n"
                                 f"Memories: {len(ep.memory_ids)}\n"
-                                f"Emotion: {ep.emotion} | Importance: {ep.importance}\n"
+                                f"Emotion: {_emotion_text(ep.emotion)} | Importance: {ep.importance}\n"
                                 f"Summary: {ep.summary[:80]}...\n"
                             )
 
@@ -1207,7 +1236,7 @@ Date Range:
                                 f"ID: {m.id}\n"
                                 f"Time: {m.timestamp}\n"
                                 f"Content: {m.content}\n"
-                                f"Emotion: {m.emotion} | Importance: {m.importance}\n"
+                                f"Emotion: {_emotion_text(m.emotion)} | Importance: {m.importance}\n"
                             )
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
@@ -1240,7 +1269,7 @@ Date Range:
                             content=content,
                             image_path=image_path,
                             camera_position=camera_position,
-                            emotion=arguments.get("emotion", "neutral"),
+                            emotion=arguments.get("emotion", ""),
                             importance=arguments.get("importance", 3),
                             resolution=arguments.get("resolution"),
                         )
@@ -1253,7 +1282,7 @@ Date Range:
                                      f"Content: {memory.content}\n"
                                      f"Image: {image_path}\n"
                                      f"Camera: pan={camera_position.pan_angle}°, tilt={camera_position.tilt_angle}°\n"
-                                     f"Emotion: {memory.emotion} | Importance: {memory.importance}",
+                                     f"Emotion: {_emotion_text(memory.emotion)} | Importance: {memory.importance}",
                             )
                         ]
 
@@ -1277,7 +1306,7 @@ Date Range:
                             content=content,
                             audio_path=audio_path,
                             transcript=transcript,
-                            emotion=arguments.get("emotion", "neutral"),
+                            emotion=arguments.get("emotion", ""),
                             importance=arguments.get("importance", 3),
                         )
 
@@ -1289,7 +1318,7 @@ Date Range:
                                      f"Content: {memory.content}\n"
                                      f"Audio: {audio_path}\n"
                                      f"Transcript: {transcript}\n"
-                                     f"Emotion: {memory.emotion} | Importance: {memory.importance}",
+                                     f"Emotion: {_emotion_text(memory.emotion)} | Importance: {memory.importance}",
                             )
                         ]
 
@@ -1333,7 +1362,7 @@ Date Range:
                                 f"Time: {m.timestamp}\n"
                                 f"Content: {m.content}\n"
                                 f"Camera: {cam_pos}\n"
-                                f"Emotion: {m.emotion} | Importance: {m.importance}\n"
+                                f"Emotion: {_emotion_text(m.emotion)} | Importance: {m.importance}\n"
                                 f"{image_line}"
                             )
 
@@ -1361,7 +1390,7 @@ Date Range:
                             output_lines.append(
                                 f"--- {i}. [{m.timestamp}] ---\n"
                                 f"Content: {m.content}\n"
-                                f"Emotion: {m.emotion} | Importance: {m.importance}\n"
+                                f"Emotion: {_emotion_text(m.emotion)} | Importance: {m.importance}\n"
                             )
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
@@ -1433,7 +1462,7 @@ Date Range:
                         output_lines = [
                             f"Causal chain ({direction_label}) starting from {memory_id[:8]}...:\n",
                             "=== Starting Memory ===\n",
-                            f"[{start_memory.timestamp}] [{start_memory.emotion}]\n",
+                            f"[{start_memory.timestamp}]{_emotion_tag(start_memory.emotion)}\n",
                             f"{start_memory.content}\n",
                         ]
 
@@ -1442,7 +1471,7 @@ Date Range:
                             for i, (mem, link_type) in enumerate(chain, 1):
                                 output_lines.append(
                                     f"--- {i}. [{link_type}] {mem.id[:8]}... ---\n"
-                                    f"[{mem.timestamp}] [{mem.emotion}]\n"
+                                    f"[{mem.timestamp}]{_emotion_tag(mem.emotion)}\n"
                                     f"{mem.content}\n"
                                 )
                         else:
@@ -1470,7 +1499,7 @@ Date Range:
                             for r in tom_memories:
                                 m = r.memory
                                 memory_lines.append(
-                                    f"- [{m.emotion}] {m.content}"
+                                    f"-{_emotion_tag(m.emotion)} {m.content}"
                                 )
                             memory_context = (
                                 f"\n## {person}に関する記憶\n"

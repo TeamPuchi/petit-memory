@@ -112,7 +112,7 @@ class MemoryStoreBackend(Protocol):
 
     async def fetch_memories_with_vectors(
         self,
-        emotion: str | None = None,
+        emotion: str | tuple[str, ...] | None = None,
         category: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,

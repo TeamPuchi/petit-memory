@@ -38,7 +38,7 @@ class TestMemorySave:
         """Test save with default values."""
         memory = await memory_store.save(content="Something happened")
 
-        assert memory.emotion == "neutral"
+        assert memory.emotion == ""  # 気持ちが無ければ空（元の作りは "neutral"）
         assert memory.importance == 3
         assert memory.category == "daily"
 

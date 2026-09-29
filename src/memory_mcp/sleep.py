@@ -9,7 +9,8 @@ from datetime import datetime
 import numpy as np
 
 from .config import SleepConfig
-from .store import EMOTION_BOOST_MAP, MemoryStore
+from .emotion import emotion_strength, is_neutral, is_protected_emotion
+from .store import MemoryStore
 from .types import Memory, SleepStats
 from .vector import cosine_similarity, decode_vector
 
@@ -40,8 +41,8 @@ def calculate_retention_score(memory: Memory, now: datetime | None = None) -> fl
     importance_component = (memory.importance / 5.0) * 0.3
 
     # emotion component
-    emotion_strength = EMOTION_BOOST_MAP.get(memory.emotion, 0.0)
-    emotion_component = emotion_strength * 0.2
+    # 日本語の言葉は元の 8 語の仲間の強さ（emotion.py）
+    emotion_component = emotion_strength(memory.emotion) * 0.2
 
     # recency component (half-life 30 days)
     try:
@@ -63,7 +64,7 @@ def _is_protected(memory: Memory, config: SleepConfig) -> bool:
     """保護対象かどうか判定する."""
     if memory.importance >= config.protected_importance:
         return True
-    if memory.emotion in config.protected_emotions:
+    if is_protected_emotion(memory.emotion, config.protected_emotions):
         return True
     if _is_first_experience(memory.content):
         return True
@@ -162,7 +163,7 @@ class SleepEngine:
         """忘却条件を満たすか判定する."""
         if memory.importance != 1:
             return False
-        if memory.emotion != "neutral":
+        if not is_neutral(memory.emotion):
             return False
         if memory.episode_id:
             return False
@@ -251,7 +252,7 @@ class SleepEngine:
                 best_importance = max(m.importance for m in group_mems)
                 strongest_emotion = max(
                     (m.emotion for m in group_mems),
-                    key=lambda e: EMOTION_BOOST_MAP.get(e, 0.0),
+                    key=emotion_strength,
                 )
 
                 merged_results.append({
