@@ -28,6 +28,8 @@ from .bm25 import BM25Index
 from .config import MemoryConfig
 from .consolidation import ConsolidationEngine
 from .embedding import E5EmbeddingFunction
+from .emotion import EMOTION_BOOST_MAP as EMOTION_BOOST_MAP  # memory.py から import される（元の表。参考）
+from .emotion import emotion_filter_values, emotion_strength
 from .hopfield import HopfieldRecallResult, ModernHopfieldNetwork
 from .normalizer import get_reading, normalize_japanese
 from .predictive import (
@@ -71,16 +73,7 @@ from .workspace import (
 # Score helpers (shared with memory.py callers)
 # ──────────────────────────────────────────────
 
-EMOTION_BOOST_MAP: dict[str, float] = {
-    "excited": 0.4,
-    "surprised": 0.35,
-    "moved": 0.3,
-    "sad": 0.25,
-    "happy": 0.2,
-    "nostalgic": 0.15,
-    "curious": 0.1,
-    "neutral": 0.0,
-}
+# 感情の強さは emotion.py（感情タグの強さの段 → 加点）。
 
 
 def calculate_time_decay(
@@ -103,7 +96,8 @@ def calculate_time_decay(
 
 
 def calculate_emotion_boost(emotion: str) -> float:
-    return EMOTION_BOOST_MAP.get(emotion, 0.0)
+    """感情の加点（感情タグの強さの段で決まる。古い英語の値は読み替えたタグで。emotion.py 参照）."""
+    return emotion_strength(emotion)
 
 
 def calculate_importance_boost(importance: int) -> float:
@@ -173,7 +167,7 @@ class MemoryStore:
     async def save(
         self,
         content: str,
-        emotion: str = "neutral",
+        emotion: str = "",
         importance: int = 3,
         category: str = "daily",
         episode_id: str | None = None,
@@ -200,7 +194,7 @@ class MemoryStore:
             id=memory_id,
             content=content,
             timestamp=timestamp,
-            emotion=emotion,
+            emotion=(emotion or "").strip(),
             importance=importance,
             category=category,
             episode_id=episode_id,
@@ -247,7 +241,7 @@ class MemoryStore:
         query_vec = np.array(query_emb, dtype=np.float32)
 
         candidates = await self._backend.fetch_memories_with_vectors(
-            emotion=emotion_filter,
+            emotion=emotion_filter_values(emotion_filter),
             category=category_filter,
             date_from=date_from,
             date_to=date_to,
@@ -646,7 +640,7 @@ class MemoryStore:
         # Save new merged memory
         new_memory = await self.save(
             content=merged_content,
-            emotion=emotion,
+            emotion=(emotion or "").strip(),
             importance=importance,
             category=category,
         )
@@ -767,7 +761,7 @@ class MemoryStore:
     async def save_with_auto_link(
         self,
         content: str,
-        emotion: str = "neutral",
+        emotion: str = "",
         importance: int = 3,
         category: str = "daily",
         link_threshold: float = 0.8,
@@ -788,7 +782,7 @@ class MemoryStore:
             id=memory_id,
             content=content,
             timestamp=timestamp,
-            emotion=emotion,
+            emotion=(emotion or "").strip(),
             importance=importance,
             category=category,
             linked_ids=linked_ids,

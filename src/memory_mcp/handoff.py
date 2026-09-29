@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .emotion import emotion_label
 from .types import CameraPosition, Episode, ForgetMarker, Memory, MemoryLink, SensoryData
 
 FORMAT = "petit-memory-handoff"
@@ -319,8 +320,9 @@ def describe(header: dict[str, Any], entries: list[dict[str, Any]]) -> Iterator[
                 mark for mark, on in (("[自分だけ]", entry["private"]), ("[索引なし]", not entry["indexed"])) if on
             )
             links = len(set(entry["linked_ids"]) | {link.get("target_id") for link in entry["links"]})
+            emotion = emotion_label(entry["emotion"]) or "なし"
             yield (
-                f"記憶 {entry['id']}  {entry['timestamp'][:16]}  {entry['emotion']}/{entry['category']} "
+                f"記憶 {entry['id']}  {entry['timestamp'][:16]}  {emotion}/{entry['category']} "
                 f"★{entry['importance']} {marks}".rstrip()
             )
             yield f"    {_one_line(entry['content'])}" + (f"  (つながり {links})" if links else "")

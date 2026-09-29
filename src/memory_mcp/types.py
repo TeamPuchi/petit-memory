@@ -7,7 +7,7 @@ from typing import Any
 
 
 class Emotion(str, Enum):
-    """感情タグ."""
+    """感情タグ（元の作りの英語 8 語。いまは古い値として読むだけ。新しい値はぷちの日本語: emotion.py）."""
 
     HAPPY = "happy"
     SAD = "sad"

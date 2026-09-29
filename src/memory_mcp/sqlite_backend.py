@@ -304,7 +304,7 @@ class SqliteMemoryStore:
 
     async def fetch_memories_with_vectors(
         self,
-        emotion: str | None = None,
+        emotion: str | tuple[str, ...] | None = None,
         category: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
@@ -314,8 +314,10 @@ class SqliteMemoryStore:
         conditions: list[str] = []
         params: list[Any] = []
         if emotion:
-            conditions.append("m.emotion = ?")
-            params.append(emotion)
+            # 感情は保存値の組（emotion.emotion_filter_values）で来る。1 語でも受ける
+            emotions = (emotion,) if isinstance(emotion, str) else tuple(emotion)
+            conditions.append(f"m.emotion IN ({', '.join('?' for _ in emotions)})")
+            params.extend(emotions)
         if category:
             conditions.append("m.category = ?")
             params.append(category)

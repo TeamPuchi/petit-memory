@@ -30,7 +30,7 @@ class SensoryIntegration:
         content: str,
         image_path: str,
         camera_position: CameraPosition | None = None,
-        emotion: str = "neutral",
+        emotion: str = "",
         importance: int = 3,
         category: str = "observation",
         auto_describe: bool = False,
@@ -90,7 +90,7 @@ class SensoryIntegration:
         content: str,
         audio_path: str,
         transcript: str,
-        emotion: str = "neutral",
+        emotion: str = "",
         importance: int = 3,
         category: str = "observation",
     ) -> Memory:
