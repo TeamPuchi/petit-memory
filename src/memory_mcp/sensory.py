@@ -29,19 +29,22 @@ class SensoryIntegration:
         self,
         content: str,
         image_path: str,
-        camera_position: CameraPosition,
+        camera_position: CameraPosition | None = None,
         emotion: str = "neutral",
         importance: int = 3,
         category: str = "observation",
         auto_describe: bool = False,
         resolution: str | None = None,
+        photo_id: str | None = None,
     ) -> Memory:
         """視覚記憶を保存（画像パス + カメラ位置 + base64画像）.
 
         Args:
             content: 記憶の内容（例: "朝の空を見つけた"）
             image_path: 画像ファイルパス
-            camera_position: カメラの向き
+            camera_position: カメラの向き。向きを持たないカメラ（クラウド版の機体の正面カメラ）や、
+                家のアルバムの写真・会話で添えられた写真から残すときは None
+            photo_id: 家のアルバムの写真 ID（アルバムにある写真から残すとき）。メタデータに入れる
             emotion: 感情
             importance: 重要度（1-5）
             category: カテゴリ
@@ -58,12 +61,15 @@ class SensoryIntegration:
         )
 
         # 感覚データを作成
+        metadata: dict[str, object] = {}
+        if camera_position is not None:
+            metadata["camera_position"] = camera_position.to_dict()
+        if photo_id:
+            metadata["photo_id"] = photo_id
         sensory_data = SensoryData(
             sensory_type="visual",
             file_path=image_path,
-            metadata={
-                "camera_position": camera_position.to_dict(),
-            },
+            metadata=metadata,
             description=None,  # Phase 4.3では説明生成なし
             timestamp=datetime.now(timezone.utc).isoformat(),
             image_data=image_data,
