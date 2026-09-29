@@ -60,8 +60,9 @@ class SleepConfig:
     forget_min_age_days: int = 14  # 忘却の最低経過日数
     forget_max_access: int = 3  # 忘却対象の最大アクセス回数
     protected_importance: int = 4  # この値以上は絶対保護
-    # 消されない気持ち（元の作りのまま）。日本語の言葉は emotion.py の表で「どの仲間か」を引いて当てる
-    protected_emotions: tuple[str, ...] = ("happy", "moved", "excited", "surprised")
+    # この強さ（emotion.py の感情タグの 1〜3）以上の気持ちの記憶は消されない。
+    # 元の作りの protected_emotions（happy・moved・excited・surprised）の趣旨を強さの段で表したもの
+    protected_emotion_level: int = 2
 
 
 @dataclass(frozen=True)

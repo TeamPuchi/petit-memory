@@ -203,7 +203,7 @@ class TestScoringFunctions:
     def test_emotion_boost_values(self):
         """Test emotion boost returns expected values."""
         assert calculate_emotion_boost("excited") == 0.4
-        assert calculate_emotion_boost("moved") == 0.3
+        assert calculate_emotion_boost("moved") == 0.4  # 古い moved は「感動」（喜び・強さ3）に読み替え
         assert calculate_emotion_boost("neutral") == 0.0
         assert calculate_emotion_boost("unknown") == 0.0
 

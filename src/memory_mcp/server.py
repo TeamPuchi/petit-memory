@@ -11,19 +11,33 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from .config import MemoryConfig, ServerConfig
-from .emotion import emotion_label
+from .emotion import EMOTION_TAGS, EMOTIONS, TAG_LABELS, emotion_label, normalize_emotion
 from .episode import EpisodeManager
 from .memory import MemoryStore
 from .sensory import SensoryIntegration
 from .types import FORGET_SCOPE_WITH_CONVERSATION, CameraPosition, RecentMemoryEntry
 
-# remember などの emotion の説明（ぷちが自分の言葉で書く。英語の決まった語に閉じない）
+# remember などの emotion の説明（決まった日本語のタグから一つ。強さも含む。表は emotion.py）
 EMOTION_DESCRIPTION = (
-    "このときの自分の気持ちを、自分の言葉の日本語一語で"
-    "（例: うれしい・楽しい・愉しい・わくわく・おどろいた・感動・しみじみ・なつかしい・かなしい・さみしい・きになる）。"
-    "決まった語から選ばなくてよい。「楽しい」と「愉しい」のような違いもそのまま残る。"
-    "気持ちが特に無ければ空のまま"
+    "このときの自分の気持ちを、下のタグから一つ（無ければ空のまま）。"
+    "同じ気持ちの中で弱い→強いの順: "
+    + " ／ ".join(
+        f"{EMOTIONS[emotion_id]}: " + "→".join(t.label for t in EMOTION_TAGS.values() if t.emotion_id == emotion_id)
+        for emotion_id in EMOTIONS
+    )
+    + "。強い気持ちの記憶ほど思い出しやすく、消えにくい"
 )
+EMOTION_ENUM = ["", *TAG_LABELS]
+
+
+def _input_emotion(arguments: dict[str, Any]) -> tuple[str, str]:
+    """入力の emotion を保存する値に。表に無い値は付けずに、そう伝える一行を返す."""
+    raw = arguments.get("emotion", "")
+    value = normalize_emotion(raw)
+    if value is None:
+        tags = "・".join(TAG_LABELS)
+        return "", f"\nEmotion「{raw}」はタグに無いので付けませんでした（{tags}）"
+    return value, ""
 
 
 def _emotion_tag(emotion: str | None) -> str:
@@ -82,6 +96,7 @@ class MemoryMCPServer:
                                 "type": "string",
                                 "description": EMOTION_DESCRIPTION,
                                 "default": "",
+                                "enum": EMOTION_ENUM,
                             },
                             "importance": {
                                 "type": "integer",
@@ -156,8 +171,8 @@ class MemoryMCPServer:
                             "emotion_filter": {
                                 "type": "string",
                                 "description": (
-                                    "気持ちの言葉で絞る（任意。例: うれしい）。"
-                                    "日本語で探すと、同じ気持ちの古い英語の記憶（happy・joy など）も拾う"
+                                    "感情タグで絞る（任意。例: うれしい）。"
+                                    "同じタグに読み替わる古い英語の記憶（happy・joy など）も拾う"
                                 ),
                             },
                             "category_filter": {
@@ -552,6 +567,7 @@ class MemoryMCPServer:
                                 "type": "string",
                                 "description": EMOTION_DESCRIPTION,
                                 "default": "",
+                                "enum": EMOTION_ENUM,
                             },
                             "importance": {
                                 "type": "integer",
@@ -592,6 +608,7 @@ class MemoryMCPServer:
                                 "type": "string",
                                 "description": EMOTION_DESCRIPTION,
                                 "default": "",
+                                "enum": EMOTION_ENUM,
                             },
                             "importance": {
                                 "type": "integer",
@@ -773,11 +790,12 @@ class MemoryMCPServer:
                         indexed = arguments.get("index", True)
                         private = arguments.get("private", False)
                         source_ids = tuple(str(sid) for sid in (arguments.get("source_ids") or []) if sid)
+                        emotion, emotion_note = _input_emotion(arguments)
 
                         if auto_link:
                             memory = await self._memory_store.save_with_auto_link(
                                 content=content,
-                                emotion=arguments.get("emotion", ""),
+                                emotion=emotion,
                                 importance=arguments.get("importance", 3),
                                 category=arguments.get("category", "daily"),
                                 link_threshold=arguments.get("link_threshold", 0.8),
@@ -789,7 +807,7 @@ class MemoryMCPServer:
                         else:
                             memory = await self._memory_store.save(
                                 content=content,
-                                emotion=arguments.get("emotion", ""),
+                                emotion=emotion,
                                 importance=arguments.get("importance", 3),
                                 category=arguments.get("category", "daily"),
                                 indexed=indexed,
@@ -807,7 +825,7 @@ class MemoryMCPServer:
                         return [
                             TextContent(
                                 type="text",
-                                text=f"Memory saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {_emotion_text(memory.emotion)}\nImportance: {memory.importance}\nCategory: {memory.category}{linked_info}",
+                                text=f"Memory saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {_emotion_text(memory.emotion)}\nImportance: {memory.importance}\nCategory: {memory.category}{linked_info}{emotion_note}",
                             )
                         ]
 
@@ -1265,11 +1283,12 @@ Date Range:
                             preset_id=camera_pos_data.get("preset_id"),
                         )
 
+                        emotion, emotion_note = _input_emotion(arguments)
                         memory = await self._sensory_integration.save_visual_memory(
                             content=content,
                             image_path=image_path,
                             camera_position=camera_position,
-                            emotion=arguments.get("emotion", ""),
+                            emotion=emotion,
                             importance=arguments.get("importance", 3),
                             resolution=arguments.get("resolution"),
                         )
@@ -1282,7 +1301,7 @@ Date Range:
                                      f"Content: {memory.content}\n"
                                      f"Image: {image_path}\n"
                                      f"Camera: pan={camera_position.pan_angle}°, tilt={camera_position.tilt_angle}°\n"
-                                     f"Emotion: {_emotion_text(memory.emotion)} | Importance: {memory.importance}",
+                                     f"Emotion: {_emotion_text(memory.emotion)} | Importance: {memory.importance}{emotion_note}",
                             )
                         ]
 
@@ -1302,11 +1321,12 @@ Date Range:
                         if not transcript:
                             return [TextContent(type="text", text="Error: transcript is required")]
 
+                        emotion, emotion_note = _input_emotion(arguments)
                         memory = await self._sensory_integration.save_audio_memory(
                             content=content,
                             audio_path=audio_path,
                             transcript=transcript,
-                            emotion=arguments.get("emotion", ""),
+                            emotion=emotion,
                             importance=arguments.get("importance", 3),
                         )
 
@@ -1318,7 +1338,7 @@ Date Range:
                                      f"Content: {memory.content}\n"
                                      f"Audio: {audio_path}\n"
                                      f"Transcript: {transcript}\n"
-                                     f"Emotion: {_emotion_text(memory.emotion)} | Importance: {memory.importance}",
+                                     f"Emotion: {_emotion_text(memory.emotion)} | Importance: {memory.importance}{emotion_note}",
                             )
                         ]
 

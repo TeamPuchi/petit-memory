@@ -1,4 +1,4 @@
-"""感情タグ（ぷちが書く日本語の一語）の扱い."""
+"""感情タグ（強さを含んだ、決まった日本語のタグ）の扱い."""
 
 from datetime import datetime, timedelta
 
@@ -6,84 +6,86 @@ import pytest
 
 from memory_mcp.config import SleepConfig
 from memory_mcp.emotion import (
-    EMOTION_BOOST_MAP,
-    UNKNOWN_EMOTION_STRENGTH,
-    emotion_family,
+    EMOTION_TAGS,
+    EMOTIONS,
+    LEGACY_EMOTION_TAGS,
+    LEVEL_BOOST,
+    TAG_LABELS,
     emotion_filter_values,
     emotion_label,
+    emotion_level,
     emotion_strength,
     is_neutral,
     is_protected_emotion,
+    normalize_emotion,
+    to_tag,
 )
+from memory_mcp.server import _input_emotion
 from memory_mcp.sleep import SleepEngine, _is_protected
-from memory_mcp.store import MemoryStore, calculate_emotion_boost
+from memory_mcp.store import MemoryStore
 from memory_mcp.types import Memory
 
 
-class TestStrength:
-    def test_original_table_unchanged(self):
-        """元の作りの強さの表は変えない."""
-        assert EMOTION_BOOST_MAP == {
-            "excited": 0.4, "surprised": 0.35, "moved": 0.3, "sad": 0.25,
-            "happy": 0.2, "nostalgic": 0.15, "curious": 0.1, "neutral": 0.0,
-        }
+class TestTable:
+    def test_eight_emotions_three_levels(self):
+        assert len(EMOTIONS) == 8
+        assert len(TAG_LABELS) == 24
+        for emotion_id in EMOTIONS:
+            levels = sorted(t.level for t in EMOTION_TAGS.values() if t.emotion_id == emotion_id)
+            assert levels == [1, 2, 3]
 
-    def test_legacy_english_keeps_original_values(self):
-        for word, value in EMOTION_BOOST_MAP.items():
-            assert emotion_strength(word) == value
-        # 元の表に無い英語は元どおり 0
-        assert emotion_strength("joy") == 0.0
-        assert calculate_emotion_boost("unknown") == 0.0
+    def test_tag_keeps_id_and_level_apart(self):
+        tag = to_tag("うれしい")
+        assert (tag.emotion_id, tag.level) == ("joy", 2)
+        assert to_tag("わくわく").emotion_id == "anticipation"
+
+    def test_every_legacy_value_maps_to_a_tag(self):
+        for english, label in LEGACY_EMOTION_TAGS.items():
+            assert label == "" or label in EMOTION_TAGS, english
+
+
+class TestStrength:
+    @pytest.mark.parametrize(("label", "level"), [("おだやか", 1), ("うれしい", 2), ("感動", 3), ("", 0)])
+    def test_strength_follows_level(self, label: str, level: int):
+        assert emotion_level(label) == level
+        assert emotion_strength(label) == LEVEL_BOOST[level]
+
+    def test_stronger_is_higher(self):
+        assert emotion_strength("しんみり") < emotion_strength("かなしい") < emotion_strength("すごくかなしい")
 
     @pytest.mark.parametrize(
-        ("word", "family"),
-        [
-            ("わくわく", "excited"),
-            ("楽しみ", "excited"),
-            ("おどろいた", "surprised"),
-            ("びっくりした", "surprised"),
-            ("感動", "moved"),
-            ("かなしい", "sad"),
-            ("さみしい", "sad"),
-            ("うれしい", "happy"),
-            ("楽しい", "happy"),
-            ("愉しい", "happy"),
-            ("楽しかった", "happy"),
-            ("なつかしい", "nostalgic"),
-            ("しみじみ", "nostalgic"),
-            ("きになる", "curious"),
-            ("", "neutral"),
-            ("ふつう", "neutral"),
-        ],
+        ("english", "label"),
+        [("happy", "うれしい"), ("excited", "わくわく"), ("moved", "感動"), ("nostalgic", "しんみり"),
+         ("curious", "きになる"), ("joy", "うれしい"), ("calm", "おだやか"), ("Happy", "うれしい")],
     )
-    def test_japanese_words_map_to_original_family(self, word: str, family: str):
-        assert emotion_family(word) == family
-        assert emotion_strength(word) == EMOTION_BOOST_MAP[family]
+    def test_legacy_english_reads_as_tag(self, english: str, label: str):
+        assert emotion_label(english) == label
+        assert emotion_strength(english) == emotion_strength(label)
 
-    def test_unknown_japanese_word_is_middle(self):
-        assert emotion_family("こそばゆい") is None
-        assert emotion_strength("こそばゆい") == UNKNOWN_EMOTION_STRENGTH
-        assert 0.0 < UNKNOWN_EMOTION_STRENGTH < max(EMOTION_BOOST_MAP.values())
+    def test_unknown_value_has_no_strength(self):
+        assert emotion_strength("楽しい") == 0.0
+        assert emotion_strength("bored") == 0.0
 
 
 class TestProtection:
-    def test_japanese_strong_feelings_are_protected(self):
-        protected = SleepConfig().protected_emotions
-        for word in ("楽しい", "愉しい", "うれしい", "感動", "わくわく", "おどろいた"):
-            assert is_protected_emotion(word, protected), word
-        for word in ("かなしい", "なつかしい", "きになる", "こそばゆい", ""):
-            assert not is_protected_emotion(word, protected), word
+    def test_level_two_and_up_are_protected(self):
+        level = SleepConfig().protected_emotion_level
+        for label in ("うれしい", "感動", "わくわく", "おどろいた", "かなしい", "こわい"):
+            assert is_protected_emotion(label, level), label
+        for label in ("おだやか", "しんみり", "きになる", "きょとん", "", "楽しい"):
+            assert not is_protected_emotion(label, level), label
 
-    def test_legacy_english_protection_unchanged(self):
-        protected = SleepConfig().protected_emotions
-        assert is_protected_emotion("happy", protected)
-        assert not is_protected_emotion("sad", protected)
-        assert not is_protected_emotion("joy", protected)
+    def test_legacy_protection(self):
+        level = SleepConfig().protected_emotion_level
+        for english in ("happy", "moved", "excited", "surprised"):  # 元の作りで消されなかった 4 語
+            assert is_protected_emotion(english, level), english
+        for english in ("nostalgic", "curious", "neutral"):
+            assert not is_protected_emotion(english, level), english
 
-    def test_is_protected_uses_japanese(self):
+    def test_is_protected_uses_tag(self):
         m = Memory(
             id="t", content="x", timestamp=datetime.now().isoformat(),
-            emotion="愉しい", importance=1, category="daily",
+            emotion="だいすき", importance=1, category="daily",
         )
         assert _is_protected(m, SleepConfig())
 
@@ -91,44 +93,42 @@ class TestProtection:
         assert is_neutral("")
         assert is_neutral("neutral")
         assert is_neutral(None)
-        assert not is_neutral("こそばゆい")
+        assert not is_neutral("しんみり")
+
+
+class TestInput:
+    def test_normalize(self):
+        assert normalize_emotion("うれしい") == "うれしい"
+        assert normalize_emotion(" happy ") == "うれしい"
+        assert normalize_emotion("") == ""
+        assert normalize_emotion("neutral") == ""
+        assert normalize_emotion("楽しい") is None
+
+    def test_server_input_drops_unknown_with_note(self):
+        assert _input_emotion({"emotion": "すき"}) == ("すき", "")
+        assert _input_emotion({}) == ("", "")
+        value, note = _input_emotion({"emotion": "楽しい"})
+        assert value == ""
+        assert "楽しい" in note
 
 
 class TestLabelAndFilter:
-    def test_legacy_labels(self):
-        assert emotion_label("joy") == "うれしい"
-        assert emotion_label("happy") == "うれしい"
-        assert emotion_label("sadness") == "かなしい"
-        assert emotion_label("curiosity") == "きになる"
+    def test_labels(self):
         assert emotion_label("neutral") == ""
         assert emotion_label("") == ""
-        assert emotion_label("Happy") == "うれしい"
-        assert emotion_label("bored") == ""  # 表に無い英語は出さない（petit-app と同じ）
-
-    def test_japanese_label_kept_as_written(self):
-        assert emotion_label("楽しい") == "楽しい"
-        assert emotion_label("愉しい") == "愉しい"
+        assert emotion_label("bored") == ""  # 表に無い英語は出さない
 
     def test_filter_values(self):
         assert set(emotion_filter_values("うれしい")) == {"うれしい", "joy", "happy"}
         assert set(emotion_filter_values("happy")) == {"happy", "joy", "うれしい"}
-        assert emotion_filter_values("愉しい") == ("愉しい",)
-        assert "" in emotion_filter_values("neutral")
-        assert "neutral" in emotion_filter_values("ふつう")
+        assert emotion_filter_values("だいすき") == ("だいすき",)
+        assert set(emotion_filter_values("neutral")) == {"", "neutral"}
         assert emotion_filter_values(None) is None
         assert emotion_filter_values("") is None
 
 
 @pytest.mark.asyncio
-async def test_store_keeps_word_as_written(memory_store: MemoryStore):
-    a = await memory_store.save(content="散歩", emotion="楽しい")
-    b = await memory_store.save(content="お茶", emotion=" 愉しい ")
-    assert (await memory_store.get_by_id(a.id)).emotion == "楽しい"
-    assert (await memory_store.get_by_id(b.id)).emotion == "愉しい"
-
-
-@pytest.mark.asyncio
-async def test_search_japanese_filter_finds_legacy(memory_store: MemoryStore):
+async def test_search_tag_filter_finds_legacy(memory_store: MemoryStore):
     await memory_store.save(content="ひなたぼっこした", emotion="happy")
     await memory_store.save(content="ひなたぼっこ気持ちよかった", emotion="うれしい")
     await memory_store.save(content="ひなたぼっこで寝た", emotion="joy")
@@ -139,14 +139,14 @@ async def test_search_japanese_filter_finds_legacy(memory_store: MemoryStore):
 
 
 @pytest.mark.asyncio
-async def test_sleep_forgets_empty_but_keeps_japanese(memory_store: MemoryStore, set_memory_timestamp):
+async def test_sleep_uses_levels(memory_store: MemoryStore, set_memory_timestamp):
     # 似た記憶はまとめられるので、種類を分けて一つずつ残す
     old = (datetime.now() - timedelta(days=30)).isoformat()
     await memory_store.save(content="何もない日", emotion="", importance=1, category="daily")
     await set_memory_timestamp(memory_store, old, content="何もない日")
-    await memory_store.save(content="ふしぎな音", emotion="こそばゆい", importance=1, category="observation")
+    await memory_store.save(content="ふしぎな音", emotion="きになる", importance=1, category="observation")
     await set_memory_timestamp(memory_store, old, content="ふしぎな音")
-    await memory_store.save(content="お茶の時間", emotion="愉しい", importance=1, category="feeling")
+    await memory_store.save(content="お茶の時間", emotion="うれしい", importance=1, category="feeling")
     await set_memory_timestamp(memory_store, old, content="お茶の時間")
 
     await SleepEngine(memory_store).run(dry_run=False)
@@ -154,4 +154,4 @@ async def test_sleep_forgets_empty_but_keeps_japanese(memory_store: MemoryStore,
     remaining = {m.content for m in await memory_store.get_all()}
     assert "何もない日" not in remaining  # 気持ちの無い記憶は元どおり忘れる対象
     assert "ふしぎな音" in remaining  # 気持ちが付いていれば忘れない（元どおり）
-    assert "お茶の時間" in remaining  # 「愉しい」は happy の仲間 → 消されない
+    assert "お茶の時間" in remaining  # 強さ 2 以上は消されない

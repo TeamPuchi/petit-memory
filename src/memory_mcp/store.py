@@ -28,7 +28,7 @@ from .bm25 import BM25Index
 from .config import MemoryConfig
 from .consolidation import ConsolidationEngine
 from .embedding import E5EmbeddingFunction
-from .emotion import EMOTION_BOOST_MAP as EMOTION_BOOST_MAP  # memory.py から import される
+from .emotion import EMOTION_BOOST_MAP as EMOTION_BOOST_MAP  # memory.py から import される（元の表。参考）
 from .emotion import emotion_filter_values, emotion_strength
 from .hopfield import HopfieldRecallResult, ModernHopfieldNetwork
 from .normalizer import get_reading, normalize_japanese
@@ -73,7 +73,7 @@ from .workspace import (
 # Score helpers (shared with memory.py callers)
 # ──────────────────────────────────────────────
 
-# 感情の強さの表は emotion.py（元の作りの値のまま）。ここから import している名前は残す。
+# 感情の強さは emotion.py（感情タグの強さの段 → 加点）。
 
 
 def calculate_time_decay(
@@ -96,7 +96,7 @@ def calculate_time_decay(
 
 
 def calculate_emotion_boost(emotion: str) -> float:
-    """感情の強さ（日本語の言葉は元の 8 語の仲間の強さ。emotion.py 参照）."""
+    """感情の加点（感情タグの強さの段で決まる。古い英語の値は読み替えたタグで。emotion.py 参照）."""
     return emotion_strength(emotion)
 
 

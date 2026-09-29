@@ -41,7 +41,7 @@ def calculate_retention_score(memory: Memory, now: datetime | None = None) -> fl
     importance_component = (memory.importance / 5.0) * 0.3
 
     # emotion component
-    # 日本語の言葉は元の 8 語の仲間の強さ（emotion.py）
+    # 感情タグの強さの段で決まる（emotion.py）
     emotion_component = emotion_strength(memory.emotion) * 0.2
 
     # recency component (half-life 30 days)
@@ -64,7 +64,7 @@ def _is_protected(memory: Memory, config: SleepConfig) -> bool:
     """保護対象かどうか判定する."""
     if memory.importance >= config.protected_importance:
         return True
-    if is_protected_emotion(memory.emotion, config.protected_emotions):
+    if is_protected_emotion(memory.emotion, config.protected_emotion_level):
         return True
     if _is_first_experience(memory.content):
         return True
