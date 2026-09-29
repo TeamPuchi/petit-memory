@@ -193,7 +193,7 @@ async def test_filters_and_recency(dynamo_backend: DynamoMemoryStore) -> None:
     assert {c.memory.id for c in happy} == {"m0", "m2"}
 
     # 感情は保存値の組でも絞れる（日本語で探して古い英語の記憶も拾う）
-    either = await dynamo_backend.fetch_memories_with_vectors(emotion=("うれしい", "happy", "joy"))
+    either = await dynamo_backend.fetch_memories_with_vectors(emotion=("嬉しい", "happy", "joy"))
     assert {c.memory.id for c in either} == {"m0", "m2"}
 
     technical = await dynamo_backend.fetch_memories_with_vectors(category="technical")

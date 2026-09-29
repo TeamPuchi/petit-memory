@@ -26,7 +26,7 @@ EMOTION_DESCRIPTION = (
         f"{EMOTIONS[emotion_id]}: " + "→".join(t.label for t in EMOTION_TAGS.values() if t.emotion_id == emotion_id)
         for emotion_id in EMOTIONS
     )
-    + "。強い気持ちの記憶ほど思い出しやすく、消えにくい"
+    + "。喜び・信頼・驚き・期待は強いほど思い出しやすく、消えにくい。悲しみ・嫌悪・怒り・恐れは消えやすい"
 )
 EMOTION_ENUM = ["", *TAG_LABELS]
 
@@ -42,7 +42,7 @@ def _input_emotion(arguments: dict[str, Any]) -> tuple[str, str]:
 
 
 def _emotion_tag(emotion: str | None) -> str:
-    """一覧の見出しに付ける " [うれしい]"。古い英語の値は日本語に。気持ちが無ければ付けない."""
+    """一覧の見出しに付ける " [嬉しい]"。古い英語の値は日本語に。気持ちが無ければ付けない."""
     label = emotion_label(emotion)
     return f" [{label}]" if label else ""
 
@@ -53,7 +53,7 @@ def _emotion_text(emotion: str | None) -> str:
 
 
 def _emotion_counts(by_emotion: dict[str, int]) -> dict[str, int]:
-    """統計の感情別の数を、表示の日本語でまとめ直す（happy と joy は「うれしい」に合算）."""
+    """統計の感情別の数を、表示の日本語でまとめ直す（happy と joy は「嬉しい」に合算）."""
     counts: dict[str, int] = {}
     for emotion, count in by_emotion.items():
         key = _emotion_text(emotion)
@@ -172,7 +172,7 @@ class MemoryMCPServer:
                             "emotion_filter": {
                                 "type": "string",
                                 "description": (
-                                    "感情タグで絞る（任意。例: うれしい）。"
+                                    "感情タグで絞る（任意。例: 嬉しい）。"
                                     "同じタグに読み替わる古い英語の記憶（happy・joy など）も拾う"
                                 ),
                             },

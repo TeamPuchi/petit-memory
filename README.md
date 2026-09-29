@@ -268,7 +268,7 @@ uv remove --dev chromadb
   "content": "User said good morning",
   "audio_path": "/tmp/audio.wav",
   "transcript": "Good morning! How are you?",
-  "emotion": "うれしい"
+  "emotion": "嬉しい"
 }
 ```
 
@@ -377,7 +377,7 @@ Theory of Mind: 視点取得ツール。応答前にこれを呼び出し、相�
 
 **保護ルール(絶対に変更されない):**
 - `importance >= 4`
-- 感情タグの強さが2以上（下の「感情ラベル」。古い `happy`・`moved`・`excited`・`surprised` もここに入る）
+- 感情タグが喜び・信頼・驚き・期待で強さ2以上（下の「感情ラベル」。古い `happy`・`moved`・`excited`・`surprised` もここに入る）
 - 内容に「初めて」「はじめて」「first time」を含む(初めての経験)
 - エピソードに含まれる記憶(削除は不可、減衰は可)
 
@@ -385,7 +385,7 @@ Theory of Mind: 視点取得ツール。応答前にこれを呼び出し、相�
 ```
 retention = (importance/5)*0.3 + emotion_strength*0.2 + recency*0.3 + access_frequency*0.2
 ```
-- `emotion_strength` は感情タグの強さの加点（0.0〜0.4）
+- `emotion_strength` は感情タグの強さの加点（0.0〜0.4。悲しみ・嫌悪・怒り・恐れは半分）
 - `recency = exp(-age_days / 30)`
 - `access_frequency = min(1.0, access_count / 10)`
 
@@ -399,7 +399,8 @@ retention = (importance/5)*0.3 + emotion_strength*0.2 + recency*0.3 + access_fre
 | `forget_min_age_days` | 14 | 忘却の対象となる最低経過日数 |
 | `forget_max_access` | 3 | 忘却の対象となる最大アクセス回数 |
 | `protected_importance` | 4 | この値以上の重要度は常に保護される |
-| `protected_emotion_level` | 2 | この強さ以上の感情タグの記憶は常に保護される |
+| `protected_emotions` | joy, trust, surprise, anticipation | これらの感情で強さが下の値以上の記憶は常に保護される |
+| `protected_emotion_level` | 2 | 保護する強さの下限 |
 
 **cron設定例(毎晩の実行を推奨):**
 
@@ -438,18 +439,19 @@ asyncio.run(main())
 
 | 感情（ID） | 強さ1 | 強さ2 | 強さ3 | プルチックの言葉 |
 |---|---|---|---|---|
-| 喜び（joy） | おだやか | うれしい | 感動 | 平穏 → 喜び → 恍惚 |
-| 信頼（trust） | あんしん | すき | だいすき | 受容 → 信頼 → 敬愛 |
-| 恐れ（fear） | ふあん | こわい | すごくこわい | 不安 → 恐れ → 恐怖 |
-| 驚き（surprise） | きょとん | おどろいた | びっくり | 放心 → 驚き → 驚嘆 |
-| 悲しみ（sadness） | しんみり | かなしい | すごくかなしい | 哀愁 → 悲しみ → 悲嘆 |
-| 嫌悪（disgust） | たいくつ | いや | だいきらい | 退屈 → 嫌悪 → 憎悪 |
-| 怒り（anger） | むっとした | おこった | すごくおこった | 苛立ち → 怒り → 激怒 |
-| 期待（anticipation） | きになる | たのしみ | わくわく | 関心 → 期待 → 警戒 |
+| 喜び（joy） | 穏やか | 嬉しい | 感動 | 平穏 → 喜び → 恍惚 |
+| 信頼（trust） | 安心 | 好き | 大好き | 受容 → 信頼 → 敬愛 |
+| 恐れ（fear） | 不安 | 怖い | すごく怖い | 不安 → 恐れ → 恐怖 |
+| 驚き（surprise） | きょとん | 驚いた | びっくり | 放心 → 驚き → 驚嘆 |
+| 悲しみ（sadness） | しんみり | 悲しい | すごく悲しい | 哀愁 → 悲しみ → 悲嘆 |
+| 嫌悪（disgust） | 退屈 | 嫌 | 大嫌い | 退屈 → 嫌悪 → 憎悪 |
+| 怒り（anger） | むっとした | 怒った | すごく怒った | 苛立ち → 怒り → 激怒 |
+| 期待（anticipation） | 気になる | 楽しみ | わくわく | 関心 → 期待 → 警戒 |
 
 - 強さが加点を決める: 強さ1＝0.1・2＝0.25・3＝0.4（気持ちなし 0.0）。思い出しやすさ（検索の順位）と、寝ている間の整理で残る点数に効く
-- 強さ2以上の記憶は整理で消されない（`protected_emotion_level`）。気持ちの無い記憶だけが忘れる対象（元どおり）
-- 古い英語の値は保存を変えず、読むときにタグへ読み替える: happy・joy→うれしい、excited→わくわく、surprised・surprise→おどろいた、moved→感動、sad・sadness・lonely→かなしい、nostalgic→しんみり、curious・curiosity→きになる、calm→おだやか、anger→むっとした、fear→こわい、neutral→なし
+- 悲しみ・嫌悪・怒り・恐れは消えやすい: 加点は半分（0.05・0.125・0.2）で、整理で守らない
+- 喜び・信頼・驚き・期待の強さ2以上の記憶は整理で消されない（`protected_emotions`・`protected_emotion_level`）。気持ちの無い記憶だけが忘れる対象（元どおり）
+- 古い英語の値は保存を変えず、読むときにタグへ読み替える: happy・joy→嬉しい、excited→わくわく、surprised・surprise→驚いた、moved→感動、sad・sadness・lonely→悲しい、nostalgic→しんみり、curious・curiosity→気になる、calm→穏やか、anger→むっとした、fear→怖い、neutral→なし
 - 表に無い値を渡すと、感情を付けずに保存して、そう返す
 - 感情で絞る（`emotion_filter`）と、同じタグに読み替わる古い英語の記憶も拾う
 

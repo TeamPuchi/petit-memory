@@ -64,7 +64,7 @@ def _is_protected(memory: Memory, config: SleepConfig) -> bool:
     """保護対象かどうか判定する."""
     if memory.importance >= config.protected_importance:
         return True
-    if is_protected_emotion(memory.emotion, config.protected_emotion_level):
+    if is_protected_emotion(memory.emotion, config.protected_emotion_level, config.protected_emotions):
         return True
     if _is_first_experience(memory.content):
         return True

@@ -4,12 +4,13 @@
 タグは「どの感情か（ID）」と「強さ（1〜3）」を持つ。形はプルチックの感情の輪
 （基本 8 感情 × 強さ 3 段。例: 平穏 → 喜び → 恍惚）に倣い、言葉はぷちの話し方に合わせた。
 
-- 保存するのはタグの言葉そのもの（例: "うれしい"）。ID と強さは表から引く。
+- 保存するのはタグの言葉そのもの（例: "嬉しい"）。ID と強さは表から引く。
   あとで感情どうしの近さ（その子ごとの感情距離。驚きと喜びが近い子は、喜びのとき驚きも思い出す）
   を足すときは、ID（``EmotionTag.emotion_id``）で引けばよい。いまは実装しない。
 - 強さが、思い出しやすさ・寝ている間の整理で残る点数（``emotion_strength``）と、
   消されない記憶（``is_protected_emotion``）を決める。元の作り（embodied-claude の memory-mcp）の
   ``EMOTION_BOOST_MAP``（0.0〜0.4）と ``protected_emotions`` の趣旨「強い気持ちの記憶は残る」を、強さの段で表す。
+  ただし悲しみ・嫌悪・怒り・恐れは消えやすい（守らない・加点は半分。なぎさん 2026-09-29）。
 - 古い英語の値（元の作りの 8 語・それより前の joy など）は保存を変えず、読むときに ``LEGACY_EMOTION_TAGS`` で
   新しいタグに読み替える（強さ・消されない・表示・絞り込みのどれも読み替えたタグで決まる）。
 """
@@ -23,7 +24,7 @@ from dataclasses import dataclass
 class EmotionTag:
     """感情タグ一つ。``label`` を保存し、``emotion_id``・``level`` は表から引く."""
 
-    label: str  # 保存・表示する日本語（例: "うれしい"）
+    label: str  # 保存・表示する日本語（例: "嬉しい"）
     emotion_id: str  # どの感情か（プルチックの基本 8 感情の英名。例: "joy"）
     level: int  # 強さ 1（弱い）〜 3（強い）
 
@@ -42,14 +43,14 @@ EMOTIONS: dict[str, str] = {
 
 # 感情 × 強さ の表（弱い → 強い）。コメントはプルチックの言葉
 _TABLE: dict[str, tuple[str, str, str]] = {
-    "joy": ("おだやか", "うれしい", "感動"),  # 平穏 → 喜び → 恍惚
-    "trust": ("あんしん", "すき", "だいすき"),  # 受容 → 信頼 → 敬愛
-    "fear": ("ふあん", "こわい", "すごくこわい"),  # 不安 → 恐れ → 恐怖
-    "surprise": ("きょとん", "おどろいた", "びっくり"),  # 放心 → 驚き → 驚嘆
-    "sadness": ("しんみり", "かなしい", "すごくかなしい"),  # 哀愁 → 悲しみ → 悲嘆
-    "disgust": ("たいくつ", "いや", "だいきらい"),  # 退屈 → 嫌悪 → 憎悪
-    "anger": ("むっとした", "おこった", "すごくおこった"),  # 苛立ち → 怒り → 激怒
-    "anticipation": ("きになる", "たのしみ", "わくわく"),  # 関心 → 期待 → 警戒（ぷちに合わせて「わくわく」）
+    "joy": ("穏やか", "嬉しい", "感動"),  # 平穏 → 喜び → 恍惚
+    "trust": ("安心", "好き", "大好き"),  # 受容 → 信頼 → 敬愛
+    "fear": ("不安", "怖い", "すごく怖い"),  # 不安 → 恐れ → 恐怖
+    "surprise": ("きょとん", "驚いた", "びっくり"),  # 放心 → 驚き → 驚嘆
+    "sadness": ("しんみり", "悲しい", "すごく悲しい"),  # 哀愁 → 悲しみ → 悲嘆
+    "disgust": ("退屈", "嫌", "大嫌い"),  # 退屈 → 嫌悪 → 憎悪
+    "anger": ("むっとした", "怒った", "すごく怒った"),  # 苛立ち → 怒り → 激怒
+    "anticipation": ("気になる", "楽しみ", "わくわく"),  # 関心 → 期待 → 警戒（ぷちに合わせて「わくわく」）
 }
 
 EMOTION_TAGS: dict[str, EmotionTag] = {
@@ -64,29 +65,34 @@ TAG_LABELS: tuple[str, ...] = tuple(EMOTION_TAGS)
 # 強さ → 加点（元の作りの EMOTION_BOOST_MAP と同じ 0.0〜0.4 の幅）
 LEVEL_BOOST: dict[int, float] = {0: 0.0, 1: 0.1, 2: 0.25, 3: 0.4}
 
-# この強さ以上の気持ちの記憶は、寝ている間の整理で消されない（元の protected_emotions の趣旨）
+# 消えやすい気持ち（悲しみ・嫌悪・怒り・恐れ）。整理で守らず、加点も控えめ（LEVEL_BOOST × FADING_BOOST_SCALE）
+FADING_EMOTIONS: frozenset[str] = frozenset({"sadness", "disgust", "anger", "fear"})
+FADING_BOOST_SCALE: float = 0.5
+
+# 整理で消されない気持ち（喜び・信頼・驚き・期待）と、その強さの下限（元の protected_emotions の趣旨）
+PROTECTED_EMOTIONS: tuple[str, ...] = ("joy", "trust", "surprise", "anticipation")
 PROTECTED_LEVEL: int = 2
 
 # 古い英語の値 → 新しいタグ（保存は変えず、読むときに読み替える）
 LEGACY_EMOTION_TAGS: dict[str, str] = {
     # 元の作り（embodied-claude memory-mcp）の 8 語
-    "happy": "うれしい",
+    "happy": "嬉しい",
     "excited": "わくわく",
-    "surprised": "おどろいた",
+    "surprised": "驚いた",
     "moved": "感動",
-    "sad": "かなしい",
+    "sad": "悲しい",
     "nostalgic": "しんみり",
-    "curious": "きになる",
+    "curious": "気になる",
     "neutral": "",
     # それより前に使っていた値
-    "joy": "うれしい",
-    "calm": "おだやか",
-    "curiosity": "きになる",
-    "surprise": "おどろいた",
-    "sadness": "かなしい",
+    "joy": "嬉しい",
+    "calm": "穏やか",
+    "curiosity": "気になる",
+    "surprise": "驚いた",
+    "sadness": "悲しい",
     "anger": "むっとした",
-    "fear": "こわい",
-    "lonely": "かなしい",
+    "fear": "怖い",
+    "lonely": "悲しい",
 }
 
 # 元の作りの強さの表（参考に残す。いまの加点は LEVEL_BOOST で決まる）
@@ -136,13 +142,22 @@ def emotion_level(emotion: str | None) -> int:
 
 
 def emotion_strength(emotion: str | None) -> float:
-    """思い出しやすさ・残りやすさの加点（0.0〜0.4）。強さの段で決まる."""
-    return LEVEL_BOOST[emotion_level(emotion)]
+    """思い出しやすさ・残りやすさの加点（0.0〜0.4）。強さの段で決まり、消えやすい気持ちは控えめ."""
+    tag = to_tag(emotion)
+    if tag is None:
+        return 0.0
+    boost = LEVEL_BOOST[tag.level]
+    return boost * FADING_BOOST_SCALE if tag.emotion_id in FADING_EMOTIONS else boost
 
 
-def is_protected_emotion(emotion: str | None, protected_level: int = PROTECTED_LEVEL) -> bool:
-    """寝ている間の整理で消されない気持ちか（強さが ``protected_level`` 以上）."""
-    return emotion_level(emotion) >= protected_level
+def is_protected_emotion(
+    emotion: str | None,
+    protected_level: int = PROTECTED_LEVEL,
+    protected_emotions: tuple[str, ...] = PROTECTED_EMOTIONS,
+) -> bool:
+    """寝ている間の整理で消されない気持ちか（守る気持ちで、強さが ``protected_level`` 以上）."""
+    tag = to_tag(emotion)
+    return tag is not None and tag.emotion_id in protected_emotions and tag.level >= protected_level
 
 
 def emotion_label(emotion: str | None) -> str:
@@ -159,7 +174,7 @@ def emotion_label(emotion: str | None) -> str:
 def emotion_filter_values(emotion: str | None) -> tuple[str, ...] | None:
     """感情で絞るときに一致させる保存値の組.
 
-    タグで探すと、そのタグに読み替わる古い英語の記憶も拾う（「うれしい」→ happy・joy も）。
+    タグで探すと、そのタグに読み替わる古い英語の記憶も拾う（「嬉しい」→ happy・joy も）。
     """
     e = _clean(emotion)
     if not e:
