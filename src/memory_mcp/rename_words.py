@@ -36,7 +36,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .config import MemoryConfig
-from .crypto_shred import seal_json
+from .crypto_shred import open_json, seal_json
 from .dynamo_backend import (
     SEALED_ATTRIBUTE,
     SECRET_MEMORY_ATTRIBUTES,
@@ -83,16 +83,19 @@ class Words:
         for word in froms:
             if to is not None and word in to:
                 raise ValueError(f"--to に --from の言葉（{word}）が入っている（走らせるたびに置き換わってしまう）")
+        if to is not None and (not to or any(c in to for c in '"\\') or any(ord(c) < 0x20 for c in to)):
+            raise ValueError('--to は空・改行・" ・\\ を含まない言葉にする（JSON で書かれた本文を壊さないため）')
         self.froms = sorted(froms, key=len, reverse=True)
         self.to = to
         self._canon: dict[str, str] = {}
         self._swap: dict[str, str] = {}
-        to_forms = _variants(to) if to is not None else []
+        # `\\uXXXX` 形の言葉は、同じ形の --to に置き換える（--to が ASCII だけならそのまま）
+        to_forms = (_variants(to) + [to, to])[:3] if to is not None else []
         for word in self.froms:
             for i, form in enumerate(_variants(word)):
                 self._canon[form] = word
                 if to_forms:
-                    self._swap[form] = to_forms[min(i, len(to_forms) - 1)]
+                    self._swap[form] = to_forms[i]
         forms = sorted(self._canon, key=len, reverse=True)
         self._re = re.compile("|".join(re.escape(f) for f in forms))
 
@@ -104,9 +107,17 @@ class Words:
             return text
         return self._re.sub(lambda m: self._swap[m.group()], text)
 
+    def settled(self, text: str) -> bool:
+        """置き換えたあとの文字列に `--from` の言葉がもう無いか。
+
+        置き換えた先と前後の文字がつながって、また `--from` の言葉になることがある（例: 「ab」→「b」で
+        「aab」が「ab」になる）。そういう記憶は、走らせるたびに置き換わるので書かない。"""
+        return self._re.search(text) is None
+
 
 def _new_tally() -> dict[str, Any]:
-    return {"seen": 0, "hit": 0, "hits": Counter(), "changed": 0, "raced": 0, "no_key": 0, "broken": 0}
+    return {"seen": 0, "hit": 0, "hits": Counter(), "changed": 0, "raced": 0, "unsettled": 0, "no_key": 0,
+            "broken": 0}
 
 
 def _write_sync(
@@ -128,8 +139,13 @@ def _write_sync(
         assert backend._shredder is not None
         dek = backend._shredder.require_key(memory_id)
         secret = {name: row.get(name) for name in SECRET_MEMORY_ATTRIBUTES}
-        secret.update(updates)
-        sets: dict[str, Any] = {SEALED_ATTRIBUTE: seal_json(dek, secret, backend._shredder.aad(memory_id, "mem"))}
+        # insert_memory と同じく、保管の形（None は空文字）にしてから閉じる
+        secret.update({name: _to_attribute(value) for name, value in updates.items()})
+        aad = backend._shredder.aad(memory_id, "mem")
+        blob = seal_json(dek, secret, aad)
+        if open_json(dek, blob, aad) != secret:  # 閉じ直したものが同じ鍵・同じ AAD で開けること
+            raise RuntimeError("sealed round trip failed for a memory")
+        sets: dict[str, Any] = {SEALED_ATTRIBUTE: blob}
         guard = (SEALED_ATTRIBUTE, _as_bytes(item[SEALED_ATTRIBUTE]))
         # 封をする前の行に平文で残っていた本文類（K28 で tags を足す前の行など）は外す
         remove = [name for name in SECRET_MEMORY_ATTRIBUTES if name in item]
@@ -209,20 +225,23 @@ def _rename_sync(backend: DynamoMemoryStore, words: Words, apply: bool, embed: E
         tally["hit"] += 1
         tally["hits"].update(hits)
         if apply and updates:
-            todo.append((item, row, updates))
+            if all(words.settled(new) for new in updates.values()):
+                todo.append((item, row, updates))
+            else:
+                tally["unsettled"] += 1
 
     if todo:
         if embed is None:
             from .embedding import E5EmbeddingFunction
 
             embed = E5EmbeddingFunction(backend._config.embedding_model)
-        contents = [updates.get("content", row.get("content") or "") for _, row, updates in todo]
-        normalized = [normalize_japanese(content) for content in contents]
-        vectors = embed(normalized)
-        for (item, row, updates), content, norm, vector in zip(todo, contents, normalized, vectors):
+        for item, row, updates in todo:
             tally = tallies[str(item["sk"]).split("#", 1)[0]]
-            full = {**updates, "normalized_content": norm, "reading": get_reading(content) or ""}
-            if _write_sync(backend, item, row, full, encode_vector(vector)):
+            # remember（MemoryStore.save）と同じ作り方: 正規化 → 読み → 1 件ずつ埋め込み
+            content = updates.get("content", row.get("content") or "")
+            norm = normalize_japanese(content)
+            full = {**updates, "normalized_content": norm, "reading": get_reading(content)}
+            if _write_sync(backend, item, row, full, encode_vector(embed([norm])[0])):
                 tally["changed"] += 1
             else:
                 tally["raced"] += 1
@@ -286,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[rename_words] {args.pid} の記憶: {'書き換えた' if args.apply else '数えただけ（書いていない）'}")
     print(f"  置き換える言葉: {'・'.join(froms)} → {to if to is not None else '（無し）'}")
     labels = (("changed", "書き換えた（ベクトルも作り直した）"), ("raced", "途中で変わったので飛ばした"),
+              ("unsettled", "置き換えてもまた当たるので書かなかった"),
               ("no_key", "鍵が無い（忘れた記憶）"), ("broken", "開けなかった"))
     for prefix, tally in result.items():
         parts = [f"見た {tally['seen']}"]

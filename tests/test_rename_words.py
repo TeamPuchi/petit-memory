@@ -156,8 +156,10 @@ async def test_default_only_counts(aws, config, store):
     assert scan(aws["house"]) == before and scan(aws["keys"]) == keys_before
     assert result == {
         # m-1: 本文 2・タグ 1・リンクの添え書き（\uXXXX 形）1。m-2 の「山田はなさん」は はなさん に当たる
-        "MEM": {"seen": 4, "hit": 2, "hits": {A: 2, B: 3}, "changed": 0, "raced": 0, "no_key": 1, "broken": 0},
-        "PRIV": {"seen": 1, "hit": 1, "hits": {B: 1}, "changed": 0, "raced": 0, "no_key": 0, "broken": 0},
+        "MEM": {"seen": 4, "hit": 2, "hits": {A: 2, B: 3}, "changed": 0, "raced": 0, "unsettled": 0, "no_key": 1,
+                "broken": 0},
+        "PRIV": {"seen": 1, "hit": 1, "hits": {B: 1}, "changed": 0, "raced": 0, "unsettled": 0, "no_key": 0,
+                 "broken": 0},
     }
 
 
@@ -288,3 +290,38 @@ def test_cli_counts_without_showing_text(aws, config, monkeypatch, capsys):
     text = capsys.readouterr().out
     assert "数えただけ" in text and "MEM: 見た 1・当たり 1" in text
     assert "里親さん" not in out and "里親さん" not in text
+
+
+async def test_derived_fields_match_what_remember_would_store(aws, config, store):
+    """書き換えたあとの正規化した本文・読み・ベクトルが、同じ本文を remember したときと同じになる。"""
+    from memory_mcp.store import MemoryStore
+
+    await remember(store, "m-1", f"{A}とＡＢＣのサーバ-を見た")
+    await rw.rename_words(config, [A], TO, apply=True, embed=fake_embed)
+
+    memory_store = MemoryStore(config)
+    memory_store._embedding_fn = fake_embed  # 記憶 MCP が保存のときに呼ぶ埋め込み
+    await memory_store.connect()
+    try:
+        fresh = await memory_store.save(content=f"{TO}とＡＢＣのサーバ-を見た")
+        rows = {str(r["id"]): r for r in store._open_memory_items_sync(store._query_memories_sync())}
+        for name in ("content", "normalized_content", "reading"):
+            assert rows["m-1"][name] == rows[fresh.id][name]
+        vectors = await store.fetch_vectors(["m-1", fresh.id])
+        assert vectors["m-1"] == vectors[fresh.id]
+    finally:
+        await memory_store.disconnect()
+
+
+async def test_a_replacement_that_would_match_again_is_not_written(aws, config, store):
+    await remember(store, "m-1", "ややまのこと")  # 「やま」→「ま」で、前の「や」とつながってまた「やま」になる
+    before = scan(aws["house"])
+    result = await rw.rename_words(config, ["やま"], "ま", apply=True, embed=fake_embed)
+    assert result["MEM"]["unsettled"] == 1 and result["MEM"]["changed"] == 0
+    assert scan(aws["house"]) == before
+
+
+async def test_to_must_not_break_json_bodies(config):
+    for bad in ('は"な', "は\\な", "は\nな", ""):
+        with pytest.raises(ValueError):
+            await rw.rename_words(config, [A], bad)
