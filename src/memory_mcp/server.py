@@ -15,6 +15,7 @@ from .config import MemoryConfig, ServerConfig
 from .emotion import EMOTION_TAGS, EMOTIONS, TAG_LABELS, emotion_label, normalize_emotion
 from .episode import EpisodeManager
 from .memory import MemoryStore
+from .preload import mark_preload
 from .sensory import SensoryIntegration
 from .types import FORGET_SCOPE_WITH_CONVERSATION, CameraPosition, RecentMemoryEntry
 
@@ -82,7 +83,8 @@ class MemoryMCPServer:
         @self._server.list_tools()
         async def list_tools() -> list[Tool]:
             """List available memory tools."""
-            return [
+            # PETIT_PRELOAD_TOOLS に書いた道具は最初から載せる（preload.py）
+            return mark_preload([
                 Tool(
                     name="remember",
                     description="Save a memory to long-term storage. Use this to remember important things, experiences, conversations, or learnings.",
@@ -780,7 +782,7 @@ class MemoryMCPServer:
                         },
                     },
                 ),
-            ]
+            ])
 
         @self._server.call_tool()
         async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
