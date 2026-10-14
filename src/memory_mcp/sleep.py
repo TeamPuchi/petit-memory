@@ -100,7 +100,9 @@ class SleepEngine:
         protected_count = 0
 
         # Phase 1: 圧縮 (merge)
-        merged_results = await self._phase_merge(candidates, now, dry_run)
+        merged_results = (
+            await self._phase_merge(candidates, now, dry_run) if self._config.merge_enabled else []
+        )
         merged_ids: set[str] = set()
         for entry in merged_results:
             merged_ids.update(entry["group"])
