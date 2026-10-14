@@ -1,7 +1,7 @@
 """Configuration for Memory MCP Server."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -55,6 +55,9 @@ class SleepConfig:
     """Sleep (memory consolidation/forgetting) configuration."""
 
     min_age_days: int = 14  # 対象の最低経過日数
+    # 似た記憶を1件にまとめる段（圧縮）。既定はしない（なぎさん 2026-10-14: まとめた記憶
+    # 「◯◯の記録 N件」は振り返るときのノイズになる）。PETIT_MEMORY_SLEEP_MERGE=1 で戻せる
+    merge_enabled: bool = field(default_factory=lambda: os.getenv("PETIT_MEMORY_SLEEP_MERGE", "0") == "1")
     similarity_threshold: float = 0.85  # 圧縮時の類似度閾値
     decay_retention_threshold: float = 0.4  # この保持スコア以下で減衰
     forget_min_age_days: int = 14  # 忘却の最低経過日数

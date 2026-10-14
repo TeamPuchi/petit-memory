@@ -352,6 +352,15 @@ class _FakeMergeStore:
     async def merge_memories(self, source_ids, merged_content, importance, emotion, category):
         self.merged.append(merged_content)
 
+    async def get_all(self):
+        return list(self.memories)
+
+    async def update_memory_fields(self, memory_id, **fields):
+        pass
+
+    async def delete_memory(self, memory_id, reason=None):
+        pass
+
 
 @pytest.mark.asyncio
 async def test_sleep_merge_keeps_full_text():
@@ -373,3 +382,31 @@ async def test_sleep_merge_keeps_full_text():
     assert long_a in merged and long_b in merged
     assert "…" not in merged
     assert results[0]["into"] == merged
+
+
+def _similar_old_pair() -> list[Memory]:
+    old = (datetime.now() - timedelta(days=30)).isoformat()
+    return [
+        Memory(id=i, content=f"朝の海を見に行った {i}", timestamp=old, emotion="neutral",
+               importance=3, category="technical", access_count=10)
+        for i in ("a", "b")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sleep_does_not_merge_by_default(monkeypatch):
+    """既定では似た記憶を「◯◯の記録 N件」にまとめない（2026-10-14 なぎさん）."""
+    monkeypatch.delenv("PETIT_MEMORY_SLEEP_MERGE", raising=False)
+    store = _FakeMergeStore(_similar_old_pair())
+    stats = await SleepEngine(store).run(dry_run=False)  # type: ignore[arg-type]
+    assert store.merged == []
+    assert stats.merged == []
+
+
+@pytest.mark.asyncio
+async def test_sleep_merges_when_enabled(monkeypatch):
+    """PETIT_MEMORY_SLEEP_MERGE=1 なら元どおりまとめる（本文は切らない）."""
+    monkeypatch.setenv("PETIT_MEMORY_SLEEP_MERGE", "1")
+    store = _FakeMergeStore(_similar_old_pair())
+    await SleepEngine(store, SleepConfig()).run(dry_run=False)  # type: ignore[arg-type]
+    assert len(store.merged) == 1
