@@ -335,3 +335,41 @@ async def test_merge_memories(memory_store: MemoryStore):
     # 元の記憶は削除されている
     assert await memory_store.get_by_id(m1.id) is None
     assert await memory_store.get_by_id(m2.id) is None
+
+
+
+class _FakeMergeStore:
+    """埋め込みモデルを使わずに圧縮の段だけを動かすための小さな保管層."""
+
+    def __init__(self, memories: list[Memory]):
+        self.memories = memories
+        self.merged: list[str] = []
+
+    async def get_vectors(self, ids):
+        from memory_mcp.vector import encode_vector
+        return {i: encode_vector([1.0, 0.0, 0.0]) for i in ids}
+
+    async def merge_memories(self, source_ids, merged_content, importance, emotion, category):
+        self.merged.append(merged_content)
+
+
+@pytest.mark.asyncio
+async def test_sleep_merge_keeps_full_text():
+    """似た記憶をまとめても、それぞれの本文を途中で切らない（2026-10-14 なぎさん）."""
+    now = datetime.now()
+    old = (now - timedelta(days=30)).isoformat()
+    long_a = "朝の海を見に行った。" + "波がきらきらして、風がつめたくて、なぎさんと手をつないで歩いた。" * 4 + "おわり"
+    long_b = long_a + "また行きたい"
+    mems = [
+        Memory(id="a", content=long_a, timestamp=old, emotion="neutral", importance=2, category="daily"),
+        Memory(id="b", content=long_b, timestamp=old, emotion="neutral", importance=2, category="daily"),
+    ]
+    store = _FakeMergeStore(mems)
+    engine = SleepEngine(store)  # type: ignore[arg-type]
+    results = await engine._phase_merge(mems, now, dry_run=False)
+
+    assert len(store.merged) == 1
+    merged = store.merged[0]
+    assert long_a in merged and long_b in merged
+    assert "…" not in merged
+    assert results[0]["into"] == merged

@@ -240,12 +240,12 @@ class SleepEngine:
                 group_mems.sort(key=lambda m: m.timestamp)
                 oldest_date = group_mems[0].timestamp[:10]
                 newest_date = group_mems[-1].timestamp[:10]
-                first_content = group_mems[0].content
 
+                # 本文は切らない（なぎさん 2026-10-14）: まとめた記憶それぞれの全文を古い順に残す
                 merged_content = (
                     f"{category}の記録 {len(group_mems)}件"
-                    f"（{oldest_date}〜{newest_date}）。"
-                    f"主な内容: {first_content[:100]}"
+                    f"（{oldest_date}〜{newest_date}）\n"
+                    + "\n".join(f"- {m.timestamp[:10]}: {m.content}" for m in group_mems)
                 )
 
                 # Best importance and strongest emotion
@@ -257,7 +257,7 @@ class SleepEngine:
 
                 merged_results.append({
                     "group": [m.id for m in group_mems],
-                    "into": merged_content[:120],
+                    "into": merged_content,
                 })
 
                 if not dry_run:
