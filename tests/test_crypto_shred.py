@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -187,12 +188,109 @@ def test_shredder_new_key_then_shred(aws) -> None:
 
 
 def test_wrapped_key_cannot_be_opened_under_another_pid(aws) -> None:
-    """KMS の暗号化コンテキスト pid が違えば解けない（鍵ポリシーの条件と同じ軸）。"""
+    """KMS の暗号化コンテキスト pid が違えば KEK は解けない（鍵ポリシーの条件と同じ軸）。"""
     mine = CryptoShredder(PID, KEYS_TABLE_NAME, KmsDataKeyWrapper(aws["key_id"]))
     mine.new_key("m1")
-    wrapped = bytes(aws["keys"].get_item(Key={"pk": "P#mio", "sk": "KEY#m1"})["Item"]["wrapped"].value)
+    wrapped = bytes(aws["keys"].get_item(Key={"pk": "P#mio", "sk": "KEK"})["Item"]["wrapped"].value)
     with pytest.raises(Exception):  # noqa: B017 - moto は InvalidCiphertextException
         KmsDataKeyWrapper(aws["key_id"]).unwrap(wrapped, "someone-else")
+
+
+class CountingWrapper:
+    """KMS を何回呼んだかを数える（#190）。"""
+
+    def __init__(self, inner: KmsDataKeyWrapper):
+        self.inner = inner
+        self.generate_calls = 0
+        self.unwrap_calls = 0
+
+    def generate(self, pid: str) -> tuple[bytes, bytes]:
+        self.generate_calls += 1
+        return self.inner.generate(pid)
+
+    def unwrap(self, wrapped: bytes, pid: str) -> bytes:
+        self.unwrap_calls += 1
+        return self.inner.unwrap(wrapped, pid)
+
+
+def test_kms_is_called_once_per_petit_not_per_item(aws) -> None:
+    """#190: 記憶をいくつ書いても読んでも、KMS はぷち 1 体につき最初の 1 回だけ。"""
+    kms = CountingWrapper(KmsDataKeyWrapper(aws["key_id"]))
+    writer = CryptoShredder(PID, KEYS_TABLE_NAME, kms)
+    deks = {f"m{i}": writer.new_key(f"m{i}") for i in range(30)}
+    assert (kms.generate_calls, kms.unwrap_calls) == (1, 0)
+
+    # 別のプロセス（コンテナの再起動・家 API）: KEK を解く 1 回だけ
+    kms2 = CountingWrapper(KmsDataKeyWrapper(aws["key_id"]))
+    reader = CryptoShredder(PID, KEYS_TABLE_NAME, kms2)
+    assert reader.keys_for(list(deks)) == deks
+    assert reader.key_for("m3") == deks["m3"]
+    assert (kms2.generate_calls, kms2.unwrap_calls) == (0, 1)
+
+    # 忘れたら、KEK が残っていても戻らない
+    reader.shred("m3")
+    reader.clear_cache()
+    assert reader.key_for("m3") is None
+    assert "m3" not in reader.keys_for(list(deks))
+
+
+def test_wrapped_dek_is_bound_to_its_row(aws) -> None:
+    """包んだ DEK を別の行へ貼り替えても解けない（AAD に item id）。"""
+    shredder = CryptoShredder(PID, KEYS_TABLE_NAME, KmsDataKeyWrapper(aws["key_id"]))
+    shredder.new_key("a")
+    shredder.new_key("b")
+    wrapped_a = aws["keys"].get_item(Key={"pk": "P#mio", "sk": "KEY#a"})["Item"]["wrapped"]
+    aws["keys"].put_item(Item={"pk": "P#mio", "sk": "KEY#b", "wrapped": wrapped_a})
+    shredder.clear_cache()
+    with pytest.raises(InvalidTag):
+        shredder.key_for("b")
+
+
+def test_legacy_kms_wrapped_rows_are_read_and_rewrapped(aws) -> None:
+    """#190 より前の行（DEK を KMS で直接包んだ形）も読め、読んだら KEK の包みに置き直す。"""
+    legacy = KmsDataKeyWrapper(aws["key_id"])
+    dek, wrapped = legacy.generate(PID)
+    aws["keys"].put_item(Item={"pk": "P#mio", "sk": "KEY#old", "wrapped": wrapped, "created_at": "2026-10-01"})
+
+    kms = CountingWrapper(legacy)
+    shredder = CryptoShredder(PID, KEYS_TABLE_NAME, kms)
+    assert shredder.keys_for(["old"]) == {"old": dek}
+    stored = bytes(aws["keys"].get_item(Key={"pk": "P#mio", "sk": "KEY#old"})["Item"]["wrapped"].value)
+    assert stored.startswith(b"PKEK1")
+
+    # 次のプロセスでは KEK の 1 回だけ
+    kms2 = CountingWrapper(legacy)
+    again = CryptoShredder(PID, KEYS_TABLE_NAME, kms2)
+    assert again.key_for("old") == dek
+    assert kms2.unwrap_calls == 1
+
+
+def test_rewrap_does_not_bring_back_a_forgotten_row(aws) -> None:
+    """読んでいる最中に忘れた前の形の行を、置き直しで生き返らせない。"""
+    legacy = KmsDataKeyWrapper(aws["key_id"])
+    dek, wrapped = legacy.generate(PID)
+    aws["keys"].put_item(Item={"pk": "P#mio", "sk": "KEY#old", "wrapped": wrapped})
+    shredder = CryptoShredder(PID, KEYS_TABLE_NAME, legacy)
+    aws["keys"].delete_item(Key={"pk": "P#mio", "sk": "KEY#old"})  # 忘れた
+    shredder._rewrap("old", wrapped, dek)
+    assert "Item" not in aws["keys"].get_item(Key={"pk": "P#mio", "sk": "KEY#old"})
+
+
+def test_two_processes_share_one_kek(aws) -> None:
+    """記憶の MCP と家 API が同時に最初の 1 本を作っても、KEK は 1 本に揃う。"""
+    a = CryptoShredder(PID, KEYS_TABLE_NAME, KmsDataKeyWrapper(aws["key_id"]))
+    b = CryptoShredder(PID, KEYS_TABLE_NAME, KmsDataKeyWrapper(aws["key_id"]))
+    first = a.kek()
+    # b は「最初の get では無かった」→ 置こうとしたら a が先に置いていた、の順を作る
+    real_get = boto3.client("dynamodb", region_name=REGION).get_item
+    calls = {"n": 0}
+
+    def get_item(**kw):
+        calls["n"] += 1
+        return {} if calls["n"] == 1 else real_get(**kw)
+
+    b._client = SimpleNamespace(get_item=get_item, put_item=boto3.client("dynamodb", region_name=REGION).put_item)
+    assert b.kek() == first
 
 
 def test_from_env_needs_both_settings(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -426,9 +524,16 @@ async def test_forgetting_a_memory_clears_its_episodes_title_and_summary(store: 
     await store.insert_memory(record(memory("mem-2", content="無事な記憶", timestamp="2026-09-25T09:40:00")))
     await store.insert_episode(
         Episode(
-            id="epi-1", title=f"{SECRET}の日", start_time="2026-09-25T09:00:00", end_time="2026-09-25T11:00:00",
-            memory_ids=("mem-1", "mem-2"), participants=("なぎ",), location_context="青海島の見える窓辺",
-            summary=f"{SECRET}をした一日", emotion="happy", importance=4,
+            id="epi-1",
+            title=f"{SECRET}の日",
+            start_time="2026-09-25T09:00:00",
+            end_time="2026-09-25T11:00:00",
+            memory_ids=("mem-1", "mem-2"),
+            participants=("なぎ",),
+            location_context="青海島の見える窓辺",
+            summary=f"{SECRET}をした一日",
+            emotion="happy",
+            importance=4,
         )
     )
 

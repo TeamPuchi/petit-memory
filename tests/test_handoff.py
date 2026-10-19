@@ -323,7 +323,7 @@ async def test_import_encrypts_each_item_with_its_own_key(cloud, aws, local_db: 
     ):
         assert secret.encode("utf-8") not in raw
 
-    keys = _scan(aws["keys"])
+    keys = [item for item in _scan(aws["keys"]) if item["sk"].startswith("KEY#")]  # KEK の行（#190）は除く
     key_ids = sorted(item["sk"] for item in keys)
     assert key_ids == sorted(f"KEY#{i}" for i in ("m-daily", "m-private", "m-hidden", "m-left", "e-1"))
     assert len({bytes(item["wrapped"].value) for item in keys}) == len(keys)  # 1 件ずつ別の鍵
